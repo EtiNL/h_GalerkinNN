@@ -1,2 +1,4 @@
 /matlab polyakov
-venv
+.venv
+.ipynb_checkpoints
+*/__pycache__

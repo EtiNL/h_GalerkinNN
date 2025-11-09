@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.integrate import quad
 
-def num_approx_burgers(x0, G, hz, ht, Tmax, L=6.0):
+def num_approx_burgers(x0, G, hz, ht, Tmax, L=np.inf):
     # -------- grid --------
     z_vals = np.arange(-7.0, 7.0 + hz, hz)
     t_vals = np.arange(0.0, Tmax + ht, ht)
@@ -51,12 +51,11 @@ if __name__ == '__main__':
 
     # -------- initial profile x0 and its primitive G --------
     def x0(q):
-        """Initial condition x0(q). Here: first Hermite (physicist) H1(q) = 2 q."""
+        """Initial condition x0(q)"""
         return  np.sin(q)
 
     def G(q):
         """Primitive of x0: G'(q) = x0(q).
-        For H1(q) = 2 q,  G(q) = q**2.
         """
         return 1 - np.cos(q)
 

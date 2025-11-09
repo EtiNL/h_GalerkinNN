@@ -1,7 +1,7 @@
 import plotly.io as pio
 import plotly.graph_objects as go
 
-def plot_sim_result(x,y,z,notebook_plot = True):
+def plot_sim_result(x,y,z,zaxis_title,notebook_plot = True):
     if notebook_plot == False:
         pio.renderers.default = "browser"
 
@@ -11,7 +11,7 @@ def plot_sim_result(x,y,z,notebook_plot = True):
                 y=y,         # t-axis
                 z=z,
                 colorscale="Viridis",
-                opacity=0.9,
+                opacity=0.95,
                 contours=dict(
                     z=dict(
                         usecolormap=True,
@@ -27,7 +27,7 @@ def plot_sim_result(x,y,z,notebook_plot = True):
         scene=dict(
             xaxis_title="z",
             yaxis_title="t",
-            zaxis_title="x(t)(z)",
+            zaxis_title=zaxis_title,
         )
     )
 

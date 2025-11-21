@@ -1,4 +1,5 @@
 /matlab polyakov
 .venv
 .ipynb_checkpoints
-*/__pycache__
+**/__pycache__/
+code_to_aggregate.txt

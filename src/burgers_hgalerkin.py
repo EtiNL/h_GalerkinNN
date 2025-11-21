@@ -2,6 +2,8 @@ import numpy as np
 from scipy.integrate import quad
 from scipy.special import eval_hermite, factorial
 from scipy.linalg import inv
+from homogeneity_utils import norm_d, dilation, dilation_n, compute_Gdn, radial_angular_decomp
+
 
 def hermit(k,y):
     return 1/np.sqrt(2**k*factorial(k)*np.sqrt(np.pi))*np.exp(-y**2/2)*eval_hermite(k,y)
@@ -45,39 +47,67 @@ def compute_Bn(Bfull, x, n):
     
     return Bn
 
+def Pi_n(x,n):
+    coefs = np.zeros(n)
+    for k in range(n):
+        num, _ = quad(lambda y:x(y)*hermit(k,y), -np.inf, np.inf, limit=200)
+        coefs[k] = num
+    return coefs
+
+def compute_alpha(Phi, An, Bn, Gdn):
+    num = Phi @ (An+Bn) @ Phi.T
+    den = Phi @ (Gdn) @ Phi.T
+    return num/den
             
-def num_approx_galerkin(x0, n, hz, ht, Tmax):
+def num_approx_hgalerkin(x0, n, hz, ht, Tmax):
+    nu = 2
 
     # -------- grid --------
     z_vals = np.arange(-7.0, 7.0 + hz, hz)
     t_vals = np.arange(0.0, Tmax + ht, ht)
     Z, T = np.meshgrid(z_vals, t_vals)
     X_gal = np.zeros_like(Z, dtype=float)
-    X_coefs = np.zeros((len(t_vals), n), dtype=float)
+    
+    Phi_coefs = np.zeros((len(t_vals), n), dtype=float)
+    r_coefs = np.zeros((len(t_vals)), dtype=float)
 
     E = np.eye(n)
     An = compute_A(n)
     Bfull = compute_Bfull(n)
+    Gdn = compute_Gdn(n)
 
-    def compute_X_coefs(i):
+    def compute_coefs(i):
         if i == 0:
-            def x0_hk_integrand(k, y):
-                return x0(y)*hermit(k,y)
-            for k in range(n):
-                num, _ = quad(lambda y:x0_hk_integrand(k,y), -np.inf, np.inf, limit=200)
-                X_coefs[i,k] = num
+            norm_d_x0 = norm_d(x0)
+            r_coefs[0] = norm_d_x0
+            Phi_coefs[0,:] = Pi_n(dilation(-np.log(norm_d_x0), x0),n)
         else:
-            Bn = compute_Bn(Bfull, X_coefs[i-1,:], n)
-            M = inv(E - ht * An - ht * Bn)
-            X_coefs[i,:] = M @ X_coefs[i-1,:]
+            Phi_p = Phi_coefs[i-1,:]
+            Bn = compute_Bn(Bfull, Phi_p, n)
+            alpha = compute_alpha(Phi_p, An, Bn, Gdn)
+            r_p = r_coefs[i-1]
+            
+
+            M1 = inv(E - ht*(r_p**nu)*(An + Bn - alpha*Gdn))
+            Phi = M1 @ Phi_p
+
+            r =  r_p/(1-ht*(r_p**nu)*alpha)
+
+            Phi_coefs[i,:] = Phi/np.linalg.norm(Phi)
+            r_coefs[i] = r
 
 
     for i, t in enumerate(t_vals):
-        compute_X_coefs(i)
+        compute_coefs(i)
         for j, z in enumerate(z_vals):
             val = 0
+            assert r_coefs[i] > 0, f"at time step {i}, r_coef_1 = {r_coefs[i]} <= 0"
+
+            X = dilation_n(Gdn, np.log(r_coefs[i]), Phi_coefs[i,:])
+
             for k in range(n):
-                val += X_coefs[i,k]*hermit(k,z)
+                val += X[k]*hermit(k,z)
+
             X_gal[i, j] = val
 
     return z_vals, t_vals, X_gal
@@ -98,7 +128,7 @@ if __name__ == '__main__':
         """Initial condition x0(q)"""
         return  np.exp(-q**2)
 
-    z_vals, t_vals, X_gal = num_approx_galerkin(x0, n, hz, ht, Tmax)
+    z_vals, t_vals, X_hgal = num_approx_hgalerkin(x0, n, hz, ht, Tmax)
 
     # interactive surface plot (x, t, M)
-    plot_sim_result(z_vals, t_vals, X_gal, 'x_gal', notebook_plot=False)
+    plot_sim_result(z_vals, t_vals, X_hgal, 'x_hgal', notebook_plot=False)

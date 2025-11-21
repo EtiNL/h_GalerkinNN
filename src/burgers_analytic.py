@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.integrate import quad
+from tqdm import tqdm
 
 def num_approx_burgers(x0, G, hz, ht, Tmax, L=np.inf):
     # -------- grid --------
@@ -33,7 +34,7 @@ def num_approx_burgers(x0, G, hz, ht, Tmax, L=np.inf):
         return num / den
 
     # -------- compute X_tr on the (t,z) grid --------
-    for i, t in enumerate(t_vals):
+    for i, t in tqdm(enumerate(t_vals), desc="Computing exact Burgers soluton..."):
         for j, z in enumerate(z_vals):
             X_tr[i, j] = x_of_tz(z, t)
 

@@ -1,0 +1,15 @@
+git+https://github.com/EtiNL/HNN.git
+
+tqdm
+numpy
+scipy
+matplotlib
+plotly
+torch
+jupyter
+pandas
+pillow
+scikit-learn
+h5py
+lz4
+zstandard

@@ -2,6 +2,7 @@ import numpy as np
 from scipy.integrate import quad
 from scipy.special import eval_hermite, factorial
 from scipy.linalg import inv
+from tqdm import tqdm
 
 def hermit(k,y):
     return 1/np.sqrt(2**k*factorial(k)*np.sqrt(np.pi))*np.exp(-y**2/2)*eval_hermite(k,y)
@@ -72,7 +73,7 @@ def num_approx_galerkin(x0, n, hz, ht, Tmax):
             X_coefs[i,:] = M @ X_coefs[i-1,:]
 
 
-    for i, t in enumerate(t_vals):
+    for i, t in tqdm(enumerate(t_vals), desc="Computing Galerkin Burgers soluton..."):
         compute_X_coefs(i)
         for j, z in enumerate(z_vals):
             val = 0

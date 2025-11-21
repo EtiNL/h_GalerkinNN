@@ -3,6 +3,7 @@ from scipy.integrate import quad
 from scipy.special import eval_hermite, factorial
 from scipy.linalg import inv
 from homogeneity_utils import norm_d, dilation, dilation_n, compute_Gdn, radial_angular_decomp
+from tqdm import tqdm
 
 
 def hermit(k,y):
@@ -97,7 +98,7 @@ def num_approx_hgalerkin(x0, n, hz, ht, Tmax):
             r_coefs[i] = r
 
 
-    for i, t in enumerate(t_vals):
+    for i, t in tqdm(enumerate(t_vals), desc="Computing hGalerkin Burgers soluton..."):
         compute_coefs(i)
         for j, z in enumerate(z_vals):
             val = 0

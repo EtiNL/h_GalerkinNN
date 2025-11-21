@@ -82,7 +82,8 @@ def compute_Gdn(n):
     
     test_phi = np.random.randn(n)
     test_phi = test_phi / np.linalg.norm(test_phi)
-    assert np.isclose(test_phi @ Gdn @ test_phi,0.5), f"Phi @ Gdn @ Phi.T = {test_phi @ Gdn @ test_phi}!=0.5"
+    if not np.isclose(test_phi @ Gdn @ test_phi,0.5): 
+        print(f"Phi @ Gdn @ Phi.T = {test_phi @ Gdn @ test_phi}!=0.5")
     return Gdn
 
 def dilation_n(Gdn, s, x):

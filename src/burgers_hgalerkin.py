@@ -89,8 +89,8 @@ def num_approx_hgalerkin(x0, n, hz, ht, Tmax):
             r_p = r_coefs[i-1]
             
 
-            M1 = inv(E - ht*(r_p**nu)*(An + Bn - alpha*Gdn))
-            Phi = M1 @ Phi_p
+            M = inv(E - ht*(r_p**nu)*(An + Bn - alpha*Gdn))
+            Phi = M @ Phi_p
 
             r =  r_p/(1-ht*(r_p**nu)*alpha)
 
@@ -99,17 +99,16 @@ def num_approx_hgalerkin(x0, n, hz, ht, Tmax):
 
 
     for i, t in tqdm(enumerate(t_vals), desc="Computing hGalerkin Burgers soluton..."):
+
         compute_coefs(i)
+        assert r_coefs[i] > 0, f"at time step {i}, r_coef_1 = {r_coefs[i]} <= 0"
+
         for j, z in enumerate(z_vals):
             val = 0
-            assert r_coefs[i] > 0, f"at time step {i}, r_coef_1 = {r_coefs[i]} <= 0"
-
-            X = dilation_n(Gdn, np.log(r_coefs[i]), Phi_coefs[i,:])
-
             for k in range(n):
-                val += X[k]*hermit(k,z)
+                val += Phi_coefs[i,k]*hermit(k,r_coefs[i]*z)
 
-            X_gal[i, j] = val
+            X_gal[i, j] = r_coefs[i]*val
 
     return z_vals, t_vals, X_gal
 
@@ -119,15 +118,15 @@ if __name__ == '__main__':
     from plot_utils import plot_sim_result
 
     # -------- parameters --------
-    n = 15           # dim sub vector space of projection
+    n = 5          # dim sub vector space of projection
     hz   = 0.1      # spatial step
-    ht   = 0.05     # time step
-    Tmax = 5   # final time
+    ht   = hz**2     # time step
+    Tmax = 1  # final time
 
     # -------- initial profile x0 --------
     def x0(q):
         """Initial condition x0(q)"""
-        return  np.exp(-q**2)
+        return  hermit(0,q)
 
     z_vals, t_vals, X_hgal = num_approx_hgalerkin(x0, n, hz, ht, Tmax)
 

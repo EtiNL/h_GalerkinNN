@@ -73,7 +73,7 @@ def num_approx_galerkin(x0, n, hz, ht, Tmax):
             X_coefs[i,:] = M @ X_coefs[i-1,:]
 
 
-    for i, t in tqdm(enumerate(t_vals), desc="Computing Galerkin Burgers soluton..."):
+    for i, t in enumerate(t_vals):
         compute_X_coefs(i)
         for j, z in enumerate(z_vals):
             val = 0

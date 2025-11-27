@@ -98,7 +98,7 @@ def num_approx_hgalerkin(x0, n, hz, ht, Tmax):
             r_coefs[i] = r
 
 
-    for i, t in tqdm(enumerate(t_vals), desc="Computing hGalerkin Burgers soluton..."):
+    for i, t in enumerate(t_vals):
 
         compute_coefs(i)
         assert r_coefs[i] > 0, f"at time step {i}, r_coef_1 = {r_coefs[i]} <= 0"

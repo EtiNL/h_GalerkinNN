@@ -152,6 +152,13 @@ from .galerkin import (
     create_galerkin_dataset,
 )
 
+# add near the other imports
+from .time_sampled_projection import (
+    TimeProjectedDatasetConfig,
+    TimeProjectedDataset,
+    create_time_projected_dataset,
+)
+
 # =============================================================================
 # Package-level utilities
 # =============================================================================
@@ -303,6 +310,11 @@ __all__ = [
     'H1InnerProduct',
     'H2InnerProduct',
     'create_galerkin_dataset',
+
+    # Time sampled projection
+    "TimeProjectedDatasetConfig",
+    "TimeProjectedDataset",
+    "create_time_projected_dataset",
     
     # High-level factories
     'create_dataset_from_simulation',

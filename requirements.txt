@@ -6,6 +6,7 @@ scipy
 matplotlib
 plotly
 torch
+torchdiffeq
 jupyter
 pandas
 pillow

@@ -16,6 +16,8 @@ from typing import Callable, Tuple, Optional, Dict, Any, Generator
 from dataclasses import dataclass
 import sys
 import os
+from scipy.special import eval_hermite, factorial
+from pde_dataset import create_time_projected_dataset, TimeProjectedDataset
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -41,6 +43,9 @@ try:
         GalerkinDatasetConfig,
         GalerkinDataset,
         create_galerkin_dataset,
+        # Time_sampled_projection
+        create_time_projected_dataset,
+        TimeProjectedDataset,
         # IO
         save_dataset,
         load_dataset,
@@ -494,6 +499,86 @@ def create_burgers_galerkin_dataset(
         problem_order=2,  # Second-order PDE
         device=device
     )
+
+def hermit(k, y):
+    return (1.0 / np.sqrt((2.0**k) * factorial(k) * np.sqrt(np.pi))
+            * np.exp(-y**2 / 2.0) * eval_hermite(k, y))
+
+def make_hermite_basis_eval(n_basis: int, scale: float, shift: float = 0.0):
+    """
+    Returns basis_eval(x_grid) -> Phi (K,nx) with
+      y=(x-shift)/scale
+      phi_k^x(x)=(1/sqrt(scale))*phi_k(y)
+    """
+    def basis_eval(x_grid):
+        x_grid = np.asarray(x_grid, dtype=float)
+        y = (x_grid - shift) / scale
+        Phi = np.stack([hermit(k, y) for k in range(n_basis)], axis=0)  # (K,nx)
+        return Phi / np.sqrt(scale)
+    return basis_eval
+
+def create_burgers_hermite_time_dataset(
+    initial_condition: BurgersInitialCondition = None,
+    hz: float = 0.1,
+    ht: float = 0.05,
+    Tmax: float = 5.0,
+    L: float = 6.0,
+    n_basis: int = 32,
+    n_time_samples: int = 200,
+    t_sampling: str = "grid",   # "grid" or "random"
+    hermite_scale: float = None,
+    hermite_shift: float = 0.0,
+    device: str = "cpu",
+    dtype: Any = None,          # torch dtype if you want, else default float32
+    normalize_t: bool = False,
+    normalize_c: bool = False,
+    return_k_coords: bool = False,
+    seed: Optional[int] = None,
+    precomputed_solution: Optional[BurgersSolution] = None,
+) -> TimeProjectedDataset:
+    if initial_condition is None:
+        initial_condition = BurgersInitialConditions.sine()
+
+    sol = precomputed_solution or BurgersSolution(
+        initial_condition=initial_condition,
+        hz=hz, ht=ht, Tmax=Tmax, L=L
+    )
+
+    x_grid = sol.z_vals  # (nx,)
+
+    if hermite_scale is None:
+        # heuristic: make y roughly in [-3,3] over the x-range
+        hermite_scale = (float(x_grid.max()) - float(x_grid.min())) / 6.0
+
+    basis_eval = make_hermite_basis_eval(
+        n_basis=n_basis,
+        scale=hermite_scale,
+        shift=hermite_shift
+    )
+
+    import torch
+    if dtype is None:
+        dtype = torch.float32
+
+    # sol is callable: sol(t,x)->u
+    return create_time_projected_dataset(
+        solution_function=sol,
+        x_grid=x_grid,
+        t_min=0.0,
+        t_max=float(sol.Tmax),
+        basis_eval=basis_eval,
+        n_time_samples=n_time_samples,
+        t_sampling=t_sampling,
+        seed=seed,
+        weights=None,  # trapezoid default
+        device=device,
+        dtype=dtype,
+        normalize_t=normalize_t,
+        normalize_c=normalize_c,
+        return_k_coords=return_k_coords,
+        pde_name="burgers",
+    )
+
 
 
 # =============================================================================

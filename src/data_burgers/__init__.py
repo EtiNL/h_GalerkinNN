@@ -53,6 +53,7 @@ from .burgers_dataset import (
     create_burgers_sequential_dataset,
     create_burgers_galerkin_dataset,
     generate_all_burgers_datasets,
+    create_burgers_hermite_time_dataset,
     
     # Utility functions
     get_burgers_solution_function,
@@ -73,6 +74,7 @@ __all__ = [
     'create_burgers_sequential_dataset',
     'create_burgers_galerkin_dataset',
     'generate_all_burgers_datasets',
+    'create_burgers_hermite_time_dataset',
     
     # Utilities
     'get_burgers_solution_function',

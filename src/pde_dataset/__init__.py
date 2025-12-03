@@ -153,10 +153,10 @@ from .galerkin import (
 )
 
 # add near the other imports
-from .time_sampled_projection import (
-    TimeProjectedDatasetConfig,
-    TimeProjectedDataset,
-    create_time_projected_dataset,
+from .neural_galerkin_ode import (
+    NeuralGalerkinDatasetConfig,
+    NeuralGalerkinDataset,
+    create_NeuralGalerkin_dataset,
 )
 
 # =============================================================================
@@ -312,9 +312,9 @@ __all__ = [
     'create_galerkin_dataset',
 
     # Time sampled projection
-    "TimeProjectedDatasetConfig",
-    "TimeProjectedDataset",
-    "create_time_projected_dataset",
+    "NeuralGalerkinDatasetConfig",
+    "NeuralGalerkinDataset",
+    "create_NeuralGalerkin_dataset",
     
     # High-level factories
     'create_dataset_from_simulation',

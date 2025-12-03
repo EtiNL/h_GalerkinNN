@@ -2,9 +2,12 @@ import numpy as np
 from scipy.integrate import quad
 from tqdm import tqdm
 
-def num_approx_burgers(x0, G, hz, ht, Tmax, L=np.inf):
+def num_approx_burgers(x0, G, hz, ht, Tmax, z_range = (-7.0, 7.0), L=np.inf):
+
+    assert z_range[0] < z_range[1], f"z_range not defined correctly: {z_range}"
+
     # -------- grid --------
-    z_vals = np.arange(-7.0, 7.0 + hz, hz)
+    z_vals = np.arange(z_range[0], z_range[1] + hz, hz)
     t_vals = np.arange(0.0, Tmax + ht, ht)
     Z, T   = np.meshgrid(z_vals, t_vals)
     X_tr   = np.zeros_like(Z, dtype=float)

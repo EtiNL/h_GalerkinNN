@@ -11,13 +11,14 @@ Uses the Cole-Hopf transformation for the analytic solution approximation.
 """
 
 import numpy as np
+import torch
+from itertools import product
 from scipy.interpolate import RegularGridInterpolator
-from typing import Callable, Tuple, Optional, Dict, Any, Generator
+from typing import Callable, Tuple, Optional, Dict, Any, Generator, List
 from dataclasses import dataclass
 import sys
 import os
 from scipy.special import eval_hermite, factorial
-from pde_dataset import create_time_projected_dataset, TimeProjectedDataset
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -43,9 +44,9 @@ try:
         GalerkinDatasetConfig,
         GalerkinDataset,
         create_galerkin_dataset,
-        # Time_sampled_projection
-        create_time_projected_dataset,
-        TimeProjectedDataset,
+        # neural_galerkin_ode
+        create_NeuralGalerkin_dataset,
+        NeuralGalerkinDataset,
         # IO
         save_dataset,
         load_dataset,
@@ -209,6 +210,7 @@ class BurgersSolution:
             hz=self.hz,
             ht=self.ht,
             Tmax=self.Tmax,
+            z_range=self.z_range,
             L=self.L
         )
         
@@ -517,38 +519,70 @@ def make_hermite_basis_eval(n_basis: int, scale: float, shift: float = 0.0):
         return Phi / np.sqrt(scale)
     return basis_eval
 
-def create_burgers_hermite_time_dataset(
-    initial_condition: BurgersInitialCondition = None,
+def create_burgers_NeuralGalerkin_dataset(
+    initial_conditions: Optional[list[BurgersInitialCondition]] = None,
     hz: float = 0.1,
-    ht: float = 0.05,
     Tmax: float = 5.0,
+    z_range: tuple[float, float] = (-7.0, 7.0),
     L: float = 6.0,
-    n_basis: int = 32,
+    n_basis: int = 5,
     n_time_samples: int = 200,
-    t_sampling: str = "grid",   # "grid" or "random"
-    hermite_scale: float = None,
-    hermite_shift: float = 0.0,
+    t_sampling: str = "grid",
     device: str = "cpu",
-    dtype: Any = None,          # torch dtype if you want, else default float32
+    dtype: Any = None,
     normalize_t: bool = False,
     normalize_c: bool = False,
     return_k_coords: bool = False,
-    seed: Optional[int] = None,
-    precomputed_solution: Optional[BurgersSolution] = None,
-) -> TimeProjectedDataset:
-    if initial_condition is None:
-        initial_condition = BurgersInitialConditions.sine()
+    seed: int = 42,
+    precomputed_solutions: Optional[List[BurgersSolution]] = None,
+) -> NeuralGalerkinDataset:
 
-    sol = precomputed_solution or BurgersSolution(
-        initial_condition=initial_condition,
-        hz=hz, ht=ht, Tmax=Tmax, L=L
-    )
+    if precomputed_solutions is not None and initial_conditions is None:
+        raise ValueError("If precomputed_solutions is provided, initial_conditions must be provided too.")
 
-    x_grid = sol.z_vals  # (nx,)
+    rng = np.random.default_rng(seed)
 
-    if hermite_scale is None:
-        # heuristic: make y roughly in [-3,3] over the x-range
-        hermite_scale = (float(x_grid.max()) - float(x_grid.min())) / 6.0
+    ht = hz**2
+    middle_z = 0.5 * (z_range[0] + z_range[1])
+    half_range_z = z_range[1] - middle_z
+
+    # generate multiple ICs if not provided
+    if initial_conditions is None:
+        amplitudes = (rng.random(2) * 5.0 + 0.3).tolist()
+        gaussian_centers = np.clip(
+            middle_z + (rng.random(3) - 0.5) * half_range_z,
+            z_range[0], z_range[1]
+        ).tolist()
+        widths = (rng.random(3) * (half_range_z / 3.0)).tolist()
+
+        params = list(product(amplitudes, gaussian_centers, widths))
+        initial_conditions = [
+            BurgersInitialConditions.gaussian(amplitude=a, center=c, width=w)
+            for (a, c, w) in params
+        ]
+
+    # build solutions (or use precomputed)
+    if precomputed_solutions is not None:
+        if len(precomputed_solutions) != len(initial_conditions):
+            raise ValueError("precomputed_solutions must match initial_conditions length")
+        solutions = precomputed_solutions
+    else:
+        solutions = [
+            BurgersSolution(
+                initial_condition=ic,
+                hz=hz, ht=ht, Tmax=Tmax, L=L, z_range=z_range
+            )
+            for ic in initial_conditions
+        ]
+
+    # consistent grid
+    x_grid = solutions[0].z_vals
+    for s in solutions[1:]:
+        if not np.allclose(s.z_vals, x_grid):
+            raise ValueError("All solutions must share the same z grid (z_vals).")
+
+    hermite_scale = (float(x_grid.max()) - float(x_grid.min())) / 6.0
+    hermite_shift = middle_z
 
     basis_eval = make_hermite_basis_eval(
         n_basis=n_basis,
@@ -556,21 +590,19 @@ def create_burgers_hermite_time_dataset(
         shift=hermite_shift
     )
 
-    import torch
     if dtype is None:
         dtype = torch.float32
 
-    # sol is callable: sol(t,x)->u
-    return create_time_projected_dataset(
-        solution_function=sol,
+    return create_NeuralGalerkin_dataset(
+        solution_functions=solutions,
         x_grid=x_grid,
         t_min=0.0,
-        t_max=float(sol.Tmax),
+        t_max=float(solutions[0].Tmax),
         basis_eval=basis_eval,
         n_time_samples=n_time_samples,
         t_sampling=t_sampling,
         seed=seed,
-        weights=None,  # trapezoid default
+        weights=None,
         device=device,
         dtype=dtype,
         normalize_t=normalize_t,
@@ -647,12 +679,20 @@ def generate_all_burgers_datasets(
         device=device,
         **gal_kwargs
     )
+
+    print("Creating NeuralGalerkin dataset...")
+    ng_kwargs = {k: v for k, v in kwargs.items() if k in ['n_basis','n_time_samples','t_sampling','normalize_t','normalize_c','seed']}
+    neural_galerkin_dataset = create_burgers_NeuralGalerkin_dataset(
+        initial_conditions=[initial_condition],  # or a list
+        hz=hz, Tmax=Tmax, L=L, device=device, **ng_kwargs
+    )
     
     result = {
         'solution': solution,
         'pinn': pinn_dataset,
         'sequential': sequential_dataset,
         'galerkin': galerkin_dataset,
+        'neural_galerkin': neural_galerkin_dataset,
     }
     
     # Save if requested
@@ -661,6 +701,7 @@ def generate_all_burgers_datasets(
         pinn_dataset.save(f"{save_path}_pinn.npz")
         sequential_dataset.save(f"{save_path}_sequential.npz")
         galerkin_dataset.save(f"{save_path}_galerkin.npz")
+        neural_galerkin_dataset.save(f"{save_path}_neural_galerkin.npz")
         print("Done!")
     
     return result
@@ -720,8 +761,13 @@ def get_burgers_generator(
 if __name__ == '__main__':
 
     # Generate all datasets at once
-    datasets = generate_all_burgers_datasets(
-        Tmax=2.0,
-        device='cuda',
-        save_path='./burgers_data'
+    # datasets = generate_all_burgers_datasets(
+    #     Tmax=2.0,
+    #     device='cuda',
+    #     save_path='burgers_datasets/burgers_'
+    # )
+
+    gaussians_neural_galerkin_dataset = create_burgers_NeuralGalerkin_dataset(
+        hz=0.1, Tmax=2.0, L=10.0, device='cuda', n_basis = 5,
     )
+    gaussians_neural_galerkin_dataset.save(f"burgers_datasets/gaussian_neural_galerkin_ds.npz")

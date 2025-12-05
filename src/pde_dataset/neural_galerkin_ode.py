@@ -121,8 +121,9 @@ class NeuralGalerkinDataset(Dataset):
         if config.normalize_c:
             c = (c - self.c_mean[None, None, :]) / self.c_std[None, None, :]
 
-        self.t = torch.tensor(t, device=device, dtype=dtype)  # (M,nT)
-        self.c = torch.tensor(c, device=device, dtype=dtype)  # (M,nT,K)
+        self.t = torch.tensor(t, device=device, dtype=torch.float64)
+        self.c = torch.tensor(c, device=device, dtype=dtype)
+
 
         self.k_coords = None
         if config.return_k_coords:

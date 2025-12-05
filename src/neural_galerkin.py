@@ -6,6 +6,7 @@ from torchdiffeq import odeint_adjoint as odeint
 import plotly.graph_objects as go
 from tqdm import tqdm
 import numpy as np
+from plot_utils import plot_sim_result
 
 # -----------------------------
 # Model
@@ -35,99 +36,110 @@ class CoeffODEFunc(nn.Module):
             x = c
         return self.net(x)
 
-
-from plot_utils import plot_sim_result
-
-
-@torch.no_grad()
-def rollout(func, t_stored: torch.Tensor, c0_stored: torch.Tensor, method="dopri5",
-            rtol=1e-6, atol=1e-6) -> torch.Tensor:
-    """
-    t_stored: (nT,) strictly increasing, in the SAME space as used during training (stored t)
-    c0_stored: (K,) or (1,K), in stored coeff space
-    returns: (nT,K) in stored coeff space
-    """
-    if c0_stored.ndim == 1:
-        c0_stored = c0_stored.unsqueeze(0)
-    c_pred = odeint(func, c0_stored, t_stored, method=method, rtol=rtol, atol=atol).squeeze(1)
-    return c_pred
-
+# If you don't want to import it, copy the same implementation you used in dataset code
+def trapz_weights_1d(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    w = np.empty_like(x)
+    w[0] = 0.5 * (x[1] - x[0])
+    w[-1] = 0.5 * (x[-1] - x[-2])
+    w[1:-1] = 0.5 * (x[2:] - x[:-2])
+    return w
 
 def _to_stored_time(ds, t_phys: torch.Tensor) -> torch.Tensor:
-    """Convert physical time -> stored time if ds.normalize_t was enabled."""
+    # physical -> stored (possibly normalized)
     if ds.config.normalize_t:
         return (t_phys - ds.t_mean) / ds.t_std
     return t_phys
 
-
-def _to_phys_time(ds, t_stored: torch.Tensor) -> torch.Tensor:
-    """Convert stored time -> physical time if ds.normalize_t was enabled."""
-    if ds.config.normalize_t:
-        return t_stored * ds.t_std + ds.t_mean
-    return t_stored
-
-
-def _u_to_numpy_on_zgrid(
-    U_tz: np.ndarray,          # (nT,nx)
-    x_grid: np.ndarray,        # (nx,)
-    z_vals: np.ndarray,        # (nz,)
-) -> np.ndarray:
-    """Interpolate U(t, x_grid) onto z_vals for each t (1D linear interp)."""
+def _u_to_numpy_on_zgrid(U_tnx: np.ndarray, x_grid: np.ndarray, z_vals: np.ndarray) -> np.ndarray:
     if np.allclose(x_grid, z_vals):
-        return U_tz
-    out = np.empty((U_tz.shape[0], z_vals.size), dtype=float)
-    for i in range(U_tz.shape[0]):
-        out[i] = np.interp(z_vals, x_grid, U_tz[i])
+        return U_tnx
+    out = np.empty((U_tnx.shape[0], z_vals.size), dtype=float)
+    for i in range(U_tnx.shape[0]):
+        out[i] = np.interp(z_vals, x_grid, U_tnx[i])
     return out
 
+@torch.no_grad()
+def rollout(func, t_stored: torch.Tensor, c0_stored: torch.Tensor,
+            method="dopri5", rtol=1e-6, atol=1e-6) -> torch.Tensor:
+    if c0_stored.ndim == 1:
+        c0_stored = c0_stored.unsqueeze(0)  # (1,K)
+    c_pred = odeint(func, c0_stored, t_stored, method=method, rtol=rtol, atol=atol)  # (nT,1,K)
+    return c_pred.squeeze(1)  # (nT,K)
+
+@torch.no_grad()
+def project_u0_to_c0_stored(ds, u0_callable) -> torch.Tensor:
+    """
+    u0_callable: function z -> u0(z) (scalar or numpy array)
+    returns c0 in *stored* coeff space (normalized if ds.normalize_c=True).
+    """
+    if ds.Phi is None:
+        raise ValueError("Dataset has no stored basis_matrix (ds.Phi is None).")
+
+    x_grid = ds.get_reconstruction_grid()  # numpy (nx,)
+    u0_np = np.asarray(u0_callable(x_grid), dtype=float).reshape(-1)  # (nx,)
+    if u0_np.shape[0] != x_grid.size:
+        raise ValueError(f"u0(x_grid) must return shape (nx,), got {u0_np.shape} for nx={x_grid.size}")
+
+    w_np = trapz_weights_1d(x_grid)  # (nx,)
+
+    device = ds.c.device
+    dtype = ds.c.dtype
+
+    u0 = torch.tensor(u0_np, device=device, dtype=dtype)     # (nx,)
+    w  = torch.tensor(w_np,  device=device, dtype=dtype)     # (nx,)
+
+    # c0_phys[k] = sum_j w_j * u0_j * Phi[k,j]
+    c0_phys = ds.Phi @ (w * u0)  # (K,)
+
+    # map to stored (normalized) space if needed
+    if ds.config.normalize_c:
+        mean = torch.as_tensor(ds.c_mean, device=device, dtype=dtype).squeeze(0)  # (K,)
+        std  = torch.as_tensor(ds.c_std,  device=device, dtype=dtype).squeeze(0)  # (K,)
+        c0_st = (c0_phys - mean) / std
+        return c0_st
+
+    return c0_phys
 
 @torch.no_grad()
 def predict_and_plot_vs_reference_surface(
     func,
-    ds,                         # NeuralGalerkinDataset (loaded or created)
-    ic_idx: int,
-    t_vals: np.ndarray,         # reference time axis (physical)
-    z_vals: np.ndarray,         # reference space axis (physical)
-    X_ref: np.ndarray,          # reference surface (nT_ref, nz_ref)
+    ds,
+    u0_callable,                # <-- NEW: use this initial condition, not ds[ic_idx]
+    t_vals: np.ndarray,
+    z_vals: np.ndarray,
+    X_ref: np.ndarray,
     method: str = "dopri5",
     rtol: float = 1e-6,
     atol: float = 1e-6,
-    notebook_plot: bool = False,
+    notebook_plot: bool = True,
 ):
-    """
-    Predict coefficients with Neural ODE at reference times, reconstruct u(t,x),
-    and plot: u_pred, u_ref, |u_ref-u_pred| using plot_sim_result.
-    """
     device = ds.c.device
 
-    # --- build evaluation time vector (physical -> stored space) ---
+    # eval times: physical -> stored
     t_phys = torch.tensor(t_vals, device=device, dtype=ds.t.dtype)
     t_stored = _to_stored_time(ds, t_phys)
-    t_stored, _ = torch.sort(t_stored)  # ensure increasing for ODE solver
+    t_stored, _ = torch.sort(t_stored)
 
-    # --- initial coeff (stored space) from dataset ---
-    t0_st, c_traj_st = ds.get_trajectory(ic_idx)  # stored space
-    # pick the earliest time sample as c0
-    t0_st_sorted, order = torch.sort(t0_st)
-    c0_st = c_traj_st[order][0]  # (K,)
+    # project u0 to c0 in stored space
+    c0_st = project_u0_to_c0_stored(ds, u0_callable)  # (K,)
 
-    # --- rollout in stored coeff space ---
-    c_pred_st = rollout(func, t_stored, c0_st, method=method, rtol=rtol, atol=atol)  # (nT_ref,K)
+    # rollout in stored space
+    c_pred_st = rollout(func, t_stored, c0_st, method=method, rtol=rtol, atol=atol)  # (nT,K)
 
-    # --- reconstruct (optionally denormalize coeffs inside reconstruct_u) ---
-    U_pred_tx = ds.reconstruct_u(c_pred_st, denormalize=True)  # (nT_ref,nx) on ds.x_grid
+    # reconstruct u on ds.x_grid and denormalize coeffs inside reconstruct_u
+    U_pred_tx = ds.reconstruct_u(c_pred_st, denormalize=True)  # (nT,nx)
     U_pred_tx_np = U_pred_tx.detach().cpu().numpy()
 
-    # --- map onto z_vals used by the reference sim (if grids differ) ---
-    x_grid = ds.get_reconstruction_grid()  # numpy (nx,)
+    # map to z_vals if grids differ
+    x_grid = ds.get_reconstruction_grid()
     U_pred_tz = _u_to_numpy_on_zgrid(U_pred_tx_np, x_grid, np.asarray(z_vals, float))
 
-    # --- reference surface ---
+    # compare with reference
     X_ref = np.asarray(X_ref, dtype=float)
     if X_ref.shape != U_pred_tz.shape:
         raise ValueError(f"Shape mismatch: X_ref {X_ref.shape} vs U_pred {U_pred_tz.shape}")
 
-    # --- plots ---
     plot_sim_result(z_vals, t_vals, U_pred_tz, "u_pred (Neural ODE)", notebook_plot=notebook_plot)
     plot_sim_result(z_vals, t_vals, X_ref, "u_ref", notebook_plot=notebook_plot)
     plot_sim_result(z_vals, t_vals, np.abs(X_ref - U_pred_tz), "abs error", notebook_plot=notebook_plot)
@@ -138,8 +150,10 @@ def predict_and_plot_vs_reference_surface(
         "U_pred": U_pred_tz,
         "U_ref": X_ref,
         "abs_err": np.abs(X_ref - U_pred_tz),
+        "c0_stored": c0_st,
         "c_pred_stored": c_pred_st,
     }
+
 
 
 @torch.no_grad()

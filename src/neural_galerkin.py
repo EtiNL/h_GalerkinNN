@@ -1,18 +1,13 @@
 """
 Fast Neural Galerkin NeuralODE training + prediction utilities (GPU-friendly).
 
-Key changes (speed + fixes + does not remove the final NeuralODE objective):
-- Removes DataLoader for CUDA-resident datasets (no pin_memory issues, far less overhead).
-- One-time preprocessing of ALL trajectories into a single packed tensor:
-    * sort by time, optional subsample, drop non-increasing times, finiteness checks.
-- Fully batched odeint on shared time grid (typical for your Burgers dataset).
-- Optional *derivative pretraining* (teacher forcing) to avoid “doesn’t learn / flat loss”
-  then fine-tunes with the exact same NeuralODE loss as before.
-- Optional whitening of coefficients for training stability when ds.config.normalize_c=False
-  (invertible affine transform; prediction/reconstruction returns physical coeffs).
-
-If your dataset uses a common time grid (grid sampling), this is much faster and usually
-converges better than the DataLoader-based loop.
+Key features:
+- Early stopping to prevent overfitting
+- Weight decay (L2 regularization)
+- Optional dropout
+- Comprehensive train/val monitoring
+- Derivative pretraining for stable initialization
+- Optional coefficient whitening
 """
 
 import math
@@ -27,20 +22,31 @@ from plot_utils import plot_sim_result
 
 
 # -----------------------------
-# Model
+# Model with Dropout Support
 # -----------------------------
 class CoeffODEFunc(nn.Module):
-    def __init__(self, K: int, hidden: int = 256, time_dependent: bool = True):
+    def __init__(self, K: int, hidden: int = 256, time_dependent: bool = True, dropout: float = 0.0):
         super().__init__()
         self.time_dependent = time_dependent
+        self.dropout = dropout
         inp = K + (1 if time_dependent else 0)
-        self.net = nn.Sequential(
-            nn.Linear(inp, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, K),
-        )
+        
+        layers = []
+        layers.append(nn.Linear(inp, hidden))
+        layers.append(nn.Tanh())
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        
+        layers.append(nn.Linear(hidden, hidden))
+        layers.append(nn.Tanh())
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        
+        layers.append(nn.Linear(hidden, K))
+        
+        self.net = nn.Sequential(*layers)
+        
+        # Initialize weights
         for m in self.net.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.5)
@@ -50,44 +56,36 @@ class CoeffODEFunc(nn.Module):
         """
         t: scalar () or (B,)
         c: (K,) or (B,K)
-
-        - torchdiffeq case: t is scalar, c is (B,K) or (K,)
-        - derivative pretrain: t can be (B,), c is (B,K)
         """
-        # Ensure c is at least 2D: (B,K)
         squeeze_back = False
         if c.ndim == 1:
-            c = c.unsqueeze(0)      # (1,K)
-            squeeze_back = True     # remember to squeeze at the end
+            c = c.unsqueeze(0)
+            squeeze_back = True
 
         B = c.shape[0]
 
         if self.time_dependent:
-            t = t.to(device=c.device)  # keep dtype float64 if needed for solver
+            t = t.to(device=c.device)
 
             if t.ndim == 0:
-                # scalar time: broadcast to batch
-                tt = t.to(dtype=c.dtype).expand(B, 1)  # (B,1)
+                tt = t.to(dtype=c.dtype).expand(B, 1)
             elif t.ndim == 1:
-                # batched time: t.shape[0] should be 1 or B
                 if t.shape[0] == 1:
                     tt = t.to(dtype=c.dtype).expand(B, 1)
                 else:
-                    assert t.shape[0] == B, \
-                        f"Time batch size {t.shape[0]} != state batch size {B}"
+                    assert t.shape[0] == B, f"Time batch size {t.shape[0]} != state batch size {B}"
                     tt = t.to(dtype=c.dtype).view(B, 1)
             else:
                 raise ValueError(f"Unsupported time tensor shape {t.shape} (expected () or (B,)).")
 
-            x = torch.cat([c, tt], dim=1)  # (B, K+1)
+            x = torch.cat([c, tt], dim=1)
         else:
             x = c
 
-        out = self.net(x)  # (B,K)
+        out = self.net(x)
         if squeeze_back:
-            out = out.squeeze(0)  # return (K,) if input was (K,)
+            out = out.squeeze(0)
         return out
-
 
 
 # -----------------------------
@@ -118,16 +116,7 @@ def _u_to_numpy_on_zgrid(U_tnx: np.ndarray, x_grid: np.ndarray, z_vals: np.ndarr
 
 
 class AffineCoeffTransform:
-    """
-    Optional coefficient whitening:
-      c_hat = (c - mean) / std
-      c = c_hat * std + mean
-
-    Used to stabilize training when ds.config.normalize_c=False.
-    This is invertible and prediction/reconstruction output is still in physical space.
-    """
     def __init__(self, mean: torch.Tensor, std: torch.Tensor):
-        # mean/std expected shape (K,) on the target device/dtype
         self.mean = mean
         self.std = std
 
@@ -139,23 +128,13 @@ class AffineCoeffTransform:
 
 
 # -----------------------------
-# One-time trajectory packing (fast + consistent)
+# One-time trajectory packing
 # -----------------------------
 @torch.no_grad()
-def pack_dataset_trajectories(
-    ds,
-    time_subsample: int | None,
-    require_shared_time: bool = True,
-):
-    """
-    Returns:
-      t_shared: (nT,) float64 (on ds device)
-      C_all:    (M,nT,K) float32
-    """
+def pack_dataset_trajectories(ds, time_subsample: int | None, require_shared_time: bool = True):
     device = ds.c.device
     M, _, K = ds.c.shape
 
-    # Build one reference processed time grid from trajectory 0
     t0, c0 = ds.get_trajectory(0)
     t_ref, c_ref = _prep_one_traj(t0, c0, time_subsample=time_subsample)
     nT = t_ref.numel()
@@ -163,13 +142,11 @@ def pack_dataset_trajectories(
     C_all = torch.empty((M, nT, K), device=device, dtype=ds.c.dtype)
     C_all[0] = c_ref
 
-    # Check + pack all
     for i in range(1, M):
         ti, ci = ds.get_trajectory(i)
         ti2, ci2 = _prep_one_traj(ti, ci, time_subsample=time_subsample)
 
         if require_shared_time and not torch.equal(ti2, t_ref):
-            # If you truly have random per-IC times, disable require_shared_time and handle lists.
             raise RuntimeError(
                 f"Trajectory {i} has a different time grid after preprocessing. "
                 f"Set require_shared_time=False or regenerate dataset with grid sampling."
@@ -186,15 +163,6 @@ def pack_dataset_trajectories(
 
 @torch.no_grad()
 def _prep_one_traj(t: torch.Tensor, c: torch.Tensor, time_subsample: int | None):
-    """
-    Same logic as your original _traj_mse preprocessing:
-      - sort by time
-      - optional subsample (unique indices)
-      - drop non-increasing times
-    Output:
-      t: (nT,) float64
-      c: (nT,K) (original dtype)
-    """
     order = torch.argsort(t)
     t = t[order].to(torch.float64)
     c = c[order]
@@ -225,33 +193,15 @@ def _prep_one_traj(t: torch.Tensor, c: torch.Tensor, time_subsample: int | None)
 # -----------------------------
 # Fast losses
 # -----------------------------
-def _mse_ode_batch(
-    func,
-    t: torch.Tensor,      # (nT,) float64
-    cB: torch.Tensor,     # (B,nT,K) float32
-    method: str,
-    rtol: float,
-    atol: float,
-    ode_options: dict | None,
-):
-    y0 = cB[:, 0, :]  # (B,K)
-    pred_tBK = odeint_fwd(func, y0, t, method=method, rtol=rtol, atol=atol, options=ode_options)  # (nT,B,K)
+def _mse_ode_batch(func, t, cB, method, rtol, atol, ode_options):
+    y0 = cB[:, 0, :]
+    pred_tBK = odeint_fwd(func, y0, t, method=method, rtol=rtol, atol=atol, options=ode_options)
     pred_BtK = pred_tBK.permute(1, 0, 2).contiguous()
     return torch.mean((pred_BtK - cB) ** 2)
 
 
 @torch.no_grad()
-def eval_mse_ode(
-    func,
-    t: torch.Tensor,
-    C: torch.Tensor,
-    ids: list[int],
-    batch_ics: int,
-    method: str,
-    rtol: float,
-    atol: float,
-    ode_options: dict | None,
-):
+def eval_mse_ode(func, t, C, ids, batch_ics, method, rtol, atol, ode_options):
     func.eval()
     tot = 0.0
     n = 0
@@ -265,22 +215,15 @@ def eval_mse_ode(
 
 
 # -----------------------------
-# Optional derivative pretraining (teacher forcing)
+# Derivative pretraining
 # -----------------------------
 def _finite_difference_dc_dt(t: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-    """
-    t: (nT,) float64
-    c: (nT,K) float32
-    returns dc/dt: (nT,K) float32 (same device)
-    """
-    # Use central differences inside, forward/backward at ends
     t0 = t[:-1]
     t1 = t[1:]
-    dt = (t1 - t0).to(c.dtype)  # (nT-1,)
-    dc = c[1:] - c[:-1]         # (nT-1,K)
-    slope = dc / dt[:, None]    # (nT-1,K)
+    dt = (t1 - t0).to(c.dtype)
+    dc = c[1:] - c[:-1]
+    slope = dc / dt[:, None]
 
-    # Build (nT,K)
     K = c.shape[1]
     out = torch.empty((c.shape[0], K), device=c.device, dtype=c.dtype)
     out[0] = slope[0]
@@ -291,25 +234,15 @@ def _finite_difference_dc_dt(t: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
 
 
 def pretrain_rhs_derivative_matching(
-    func,
-    t: torch.Tensor,
-    C: torch.Tensor,
-    train_ids: list[int],
+    func, t, C, train_ids,
     epochs: int = 200,
     lr: float = 1e-3,
     batch_ics: int = 128,
     time_batch: int = 64,
 ):
-    """
-    Fast pretraining: minimize ||f(t_i, c_i) - dc/dt||^2 on random (IC, time) samples.
-    This is a warm-start ONLY; you still fine-tune with the NeuralODE objective after.
-
-    Does not constrain final accuracy; it just makes training actually move early.
-    """
     device = C.device
     opt = torch.optim.Adam(func.parameters(), lr=lr)
 
-    # Precompute dc/dt for all trajectories once
     dC = torch.empty_like(C)
     for i in range(C.shape[0]):
         dC[i] = _finite_difference_dc_dt(t, C[i])
@@ -319,22 +252,17 @@ def pretrain_rhs_derivative_matching(
         func.train()
         opt.zero_grad(set_to_none=True)
 
-        # sample ICs
         idx_ic = torch.randint(0, len(train_ids), (min(batch_ics, len(train_ids)),), device=device)
         ic_ids = [train_ids[int(j)] for j in idx_ic.tolist()]
 
-        # sample times (avoid always hitting t=0)
         tidx = torch.randint(0, nT, (time_batch,), device=device)
-        t_s = t[tidx]  # (Tb,) float64
+        t_s = t[tidx]
 
-        # build batch (B*Tb, K)
         c_s = C[ic_ids][:, tidx, :].reshape(-1, C.shape[2])
         dc_s = dC[ic_ids][:, tidx, :].reshape(-1, C.shape[2])
 
-        # evaluate f at matching scalar times (vectorize by repeating t)
-        # torchdiffeq calls func with scalar t; here we call directly:
-        tt = t_s.to(dtype=c_s.dtype).repeat(len(ic_ids), 1).reshape(-1)  # (B*Tb,)
-        pred = func(tt, c_s)  # supports t vector since we cast/expand inside forward
+        tt = t_s.to(dtype=c_s.dtype).repeat(len(ic_ids), 1).reshape(-1)
+        pred = func(tt, c_s)
         loss = torch.mean((pred - dc_s) ** 2)
 
         loss.backward()
@@ -344,7 +272,7 @@ def pretrain_rhs_derivative_matching(
 
 
 # -----------------------------
-# Training
+# Training indices split
 # -----------------------------
 def _split_indices(M: int, val_frac: float, seed: int):
     g = torch.Generator()
@@ -356,43 +284,51 @@ def _split_indices(M: int, val_frac: float, seed: int):
     return train_ids, val_ids
 
 
+# -----------------------------
+# Main Training Function 
+# -----------------------------
 def train_neural_ode_on_neural_galerkin_dataset(
     ds,
-    val_frac: float = 0.2,
+    val_frac: float = 0.25,
     split_seed: int = 0,
     epochs: int = 2000,
     lr: float = 1e-3,
-    hidden: int = 512,
+    weight_decay: float = 1e-5,  # ✅ L2 regularization
+    hidden: int = 256,
+    dropout: float = 0.1,  # ✅ Dropout
     time_dependent: bool = True,
     method: str = "dopri5",
     rtol: float = 1e-6,
     atol: float = 1e-6,
-    batch_ics: int = 64,                  # avoid near-full-batch; helps learning
-    time_subsample: int | None = 150,     # train-time speedup
+    batch_ics: int = 64,
+    time_subsample: int | None = 150,
     grad_clip: float = 1.0,
-    print_every: int = 5,
+    print_every: int = 50,
     ode_options: dict | None = None,
-    # Stabilizers:
-    whiten_if_needed: bool = True,        # affine whitening if ds.normalize_c=False
-    # Warm-start:
+    # Stabilizers
+    whiten_if_needed: bool = True,
+    # Warm-start
     pretrain_derivative: bool = True,
-    pretrain_epochs: int = 10,
+    pretrain_epochs: int = 200,
     pretrain_lr: float = 1e-3,
-    # lr-scheduler
-    lr_schedule: str = "cosine",  # or "plateau" or "step"
-    lr_min: float = 1e-5,
+    # LR scheduler
+    lr_schedule: str = "cosine",
+    lr_min: float = 1e-6,
+    # ✅ Early stopping
+    early_stopping_patience: int = 150,
+    early_stopping_min_delta: float = 1e-7,
 ):
     device = ds.c.device
     M, _, K = ds.c.shape
 
-    # Pack dataset once (fast)
+    # Pack dataset
     t_shared, C_all = pack_dataset_trajectories(ds, time_subsample=time_subsample, require_shared_time=True)
 
-    # Optional whitening if dataset is not already normalized
+    # Optional whitening
     transform = None
     if whiten_if_needed and not ds.config.normalize_c:
-        mean = torch.as_tensor(ds.c_mean, device=device, dtype=ds.c.dtype).squeeze(0)  # (K,)
-        std = torch.as_tensor(ds.c_std, device=device, dtype=ds.c.dtype).squeeze(0)    # (K,)
+        mean = torch.as_tensor(ds.c_mean, device=device, dtype=ds.c.dtype).squeeze(0)
+        std = torch.as_tensor(ds.c_std, device=device, dtype=ds.c.dtype).squeeze(0)
         transform = AffineCoeffTransform(mean, std)
         C_train_space = transform.encode(C_all)
     else:
@@ -400,9 +336,19 @@ def train_neural_ode_on_neural_galerkin_dataset(
 
     train_ids, val_ids = _split_indices(M, val_frac=val_frac, seed=split_seed)
 
-    func = CoeffODEFunc(K, hidden=hidden, time_dependent=time_dependent).to(device)
+    # ✅ Create model with dropout support
+    func = CoeffODEFunc(K, hidden=hidden, time_dependent=time_dependent, dropout=dropout).to(device)
+    
+    print(f"\n{'='*60}")
+    print("MODEL CONFIGURATION")
+    print(f"{'='*60}")
+    print(f"Parameters: {sum(p.numel() for p in func.parameters()):,}")
+    print(f"Hidden size: {hidden}")
+    print(f"Dropout: {dropout}")
+    print(f"Weight decay: {weight_decay}")
+    print(f"Train ICs: {len(train_ids)}, Val ICs: {len(val_ids)}")
 
-    # Warm-start to avoid “flat loss / doesn’t learn”
+    # Derivative pretraining
     if pretrain_derivative and pretrain_epochs > 0:
         func = pretrain_rhs_derivative_matching(
             func,
@@ -415,25 +361,32 @@ def train_neural_ode_on_neural_galerkin_dataset(
             time_batch=min(128, t_shared.numel()),
         )
 
-    opt = torch.optim.Adam(func.parameters(), lr=lr)
+    # ✅ Optimizer with weight decay
+    opt = torch.optim.Adam(func.parameters(), lr=lr, weight_decay=weight_decay)
     
+    # LR scheduler
     if lr_schedule == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=epochs, eta_min=lr_min
-        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr_min)
     elif lr_schedule == "plateau":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             opt, mode='min', factor=0.5, patience=50, verbose=True
         )
     elif lr_schedule == "step":
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            opt, step_size=epochs//3, gamma=0.5
-        )
+        scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=epochs//3, gamma=0.5)
     else:
         scheduler = None
 
+    # ✅ Early stopping variables
     train_curve = []
     val_curve = []
+    best_val_loss = float('inf')
+    best_epoch = 0
+    patience_counter = 0
+    best_state = None
+
+    print(f"\n{'='*60}")
+    print("STARTING NEURAL ODE TRAINING")
+    print(f"{'='*60}")
 
     for ep in tqdm(range(1, epochs + 1), desc="train NeuralODE"):
         func.train()
@@ -447,7 +400,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
 
         for s in range(0, len(train_ids_shuf), batch_ics):
             b_ids = train_ids_shuf[s : s + batch_ics]
-            cB = C_train_space[b_ids]  # (B,nT,K)
+            cB = C_train_space[b_ids]
 
             opt.zero_grad(set_to_none=True)
             loss = _mse_ode_batch(func, t_shared, cB, method, rtol, atol, ode_options)
@@ -456,7 +409,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
             if grad_clip is not None:
                 nn.utils.clip_grad_norm_(func.parameters(), grad_clip)
             
-            opt.step()  # ✅ Just step the optimizer
+            opt.step()
 
             tot += float(loss.detach().item()) * len(b_ids)
             n += len(b_ids)
@@ -464,30 +417,96 @@ def train_neural_ode_on_neural_galerkin_dataset(
         train_mse = tot / max(1, n)
         train_curve.append(train_mse)
 
-        # ✅ Step scheduler ONCE per epoch AFTER computing train_mse
+        # Step scheduler once per epoch
         if scheduler is not None:
-            if lr_schedule == "plateau":
-                scheduler.step(train_mse)
+            if lr_schedule == "plateau" and len(val_ids) > 0:
+                # Plateau scheduler uses validation loss
+                val_mse = eval_mse_ode(func, t_shared, C_train_space, val_ids, batch_ics, method, rtol, atol, ode_options)
+                scheduler.step(val_mse)
             else:
                 scheduler.step()
 
-        if (ep % print_every == 0 or ep == epochs) and len(val_ids) > 0:
+        # Validation and early stopping
+        if len(val_ids) > 0:
             val_mse = eval_mse_ode(func, t_shared, C_train_space, val_ids, batch_ics, method, rtol, atol, ode_options)
             val_curve.append(val_mse)
             
-            # ✅ Print current LR
-            current_lr = opt.param_groups[0]['lr']
-            print(f"Epoch {ep}/{epochs} | Train MSE: {train_mse:.6e} | Val MSE: {val_mse:.6e} | LR: {current_lr:.6e}")
+            # Print progress
+            if ep % print_every == 0 or ep == epochs:
+                current_lr = opt.param_groups[0]['lr']
+                gap = train_mse - val_mse
+                print(f"Epoch {ep}/{epochs} | Train: {train_mse:.6e} | Val: {val_mse:.6e} | "
+                      f"Gap: {gap:+.6e} | LR: {current_lr:.6e} | Patience: {patience_counter}/{early_stopping_patience}")
+            
+            # ✅ Early stopping logic
+            if val_mse < best_val_loss - early_stopping_min_delta:
+                best_val_loss = val_mse
+                best_epoch = ep
+                patience_counter = 0
+                # Save best model state
+                best_state = {k: v.cpu().clone() for k, v in func.state_dict().items()}
+                if ep % print_every == 0:
+                    print(f"  ✅ New best model! Val MSE: {best_val_loss:.6e}")
+            else:
+                patience_counter += 1
+            
+            # Check early stopping
+            if patience_counter >= early_stopping_patience:
+                print(f"\n{'='*60}")
+                print(f"✅ EARLY STOPPING at epoch {ep}")
+                print(f"Best validation loss: {best_val_loss:.6e} at epoch {best_epoch}")
+                print(f"{'='*60}")
+                break
+        else:
+            # No validation set
+            if ep % print_every == 0:
+                current_lr = opt.param_groups[0]['lr']
+                print(f"Epoch {ep}/{epochs} | Train: {train_mse:.6e} | LR: {current_lr:.6e}")
+    
+    # ✅ Restore best model
+    if best_state is not None:
+        func.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+        print(f"\n✅ Restored best model from epoch {best_epoch}")
+        print(f"Final train/val gap: {train_curve[best_epoch-1] - best_val_loss:.6e}")
 
+    # ✅ Enhanced visualization
     fig = go.Figure()
-    fig.add_trace(go.Scatter(y=train_curve, mode="lines", name="train"))
+    fig.add_trace(go.Scatter(y=train_curve, mode="lines", name="train", line=dict(width=2)))
+    
     if len(val_curve) > 0:
-        # val is sampled every print_every; plot against those epochs
-        x_val = list(range(print_every, print_every * len(val_curve) + 1, print_every))
-        if x_val[-1] != epochs:
-            x_val[-1] = epochs
-        fig.add_trace(go.Scatter(x=x_val, y=val_curve, mode="lines", name="val"))
-    fig.update_layout(title="Neural ODE training curves", xaxis_title="epoch", yaxis_title="MSE")
+        # Validation is computed every epoch now
+        fig.add_trace(go.Scatter(y=val_curve, mode="lines", name="val", line=dict(width=2)))
+        
+        # Mark best epoch
+        if best_epoch > 0:
+            fig.add_vline(
+                x=best_epoch - 1, 
+                line_dash="dash", 
+                line_color="green",
+                annotation_text=f"Best (epoch {best_epoch})",
+                annotation_position="top"
+            )
+        
+        # Calculate and display overfitting region
+        if len(val_curve) > 10:
+            best_idx = np.argmin(val_curve)
+            overfit_region = val_curve[best_idx:] if best_idx < len(val_curve) - 1 else []
+            if len(overfit_region) > 5:
+                fig.add_vrect(
+                    x0=best_idx, x1=len(val_curve)-1,
+                    fillcolor="red", opacity=0.1,
+                    annotation_text="Overfitting region",
+                    annotation_position="top right"
+                )
+    
+    fig.update_layout(
+        title="Neural ODE Training Curves",
+        xaxis_title="Epoch",
+        yaxis_title="MSE",
+        yaxis_type="log",
+        height=500,
+        showlegend=True
+    )
     fig.show()
 
     info = {
@@ -496,36 +515,27 @@ def train_neural_ode_on_neural_galerkin_dataset(
         "train_curve": train_curve,
         "val_curve": val_curve,
         "t_shared": t_shared,
-        "transform": transform,  # used by predict utilities below
+        "transform": transform,
         "time_subsample": time_subsample,
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val_loss,
+        "final_train_loss": train_curve[best_epoch-1] if best_epoch > 0 else train_curve[-1],
+        "config": {
+            "hidden": hidden,
+            "dropout": dropout,
+            "weight_decay": weight_decay,
+            "lr": lr,
+            "early_stopping_patience": early_stopping_patience,
+        }
     }
     return func, info
 
 
 # -----------------------------
-# Rollout / projection helpers (transform-aware)
+# Hermite basis for projection
 # -----------------------------
 @torch.no_grad()
-def rollout(
-    func,
-    t_stored: torch.Tensor,
-    c0: torch.Tensor,
-    method="dopri5",
-    rtol=1e-6,
-    atol=1e-6,
-    options=None,
-) -> torch.Tensor:
-    if c0.ndim == 1:
-        c0 = c0.unsqueeze(0)  # (1,K)
-    c_pred = odeint_fwd(func, c0, t_stored, method=method, rtol=rtol, atol=atol, options=options)
-    return c_pred.squeeze(1)  # (nT,K)
-
-@torch.no_grad()
 def hermite_basis_x_torch(x: torch.Tensor, K: int, scale: float, shift: float) -> torch.Tensor:
-    """
-    Stable Hermite functions basis (orthonormal in L²(ℝ)) with scaling.
-    Returns: (K, nx) tensor where Phi[k, :] is the k-th basis function.
-    """
     y = (x - shift) / scale
     y_flat = y.reshape(-1)
     M = y_flat.numel()
@@ -548,27 +558,22 @@ def hermite_basis_x_torch(x: torch.Tensor, K: int, scale: float, shift: float) -
     return Phi / math.sqrt(scale)
 
 
+# -----------------------------
+# Rollout and projection
+# -----------------------------
+@torch.no_grad()
+def rollout(func, t_stored, c0, method="dopri5", rtol=1e-6, atol=1e-6, options=None):
+    if c0.ndim == 1:
+        c0 = c0.unsqueeze(0)
+    c_pred = odeint_fwd(func, c0, t_stored, method=method, rtol=rtol, atol=atol, options=options)
+    return c_pred.squeeze(1)
+
+
 @torch.no_grad()
 def project_u0_to_c0_stored(ds, u0_callable) -> torch.Tensor:
-    """
-    Project arbitrary initial condition onto the dataset's basis.
-    
-    This correctly handles:
-    - Scaled and shifted Hermite basis
-    - Orthonormalized basis (if used during dataset generation)
-    - Proper quadrature weights
-    
-    Args:
-        ds: NeuralGalerkinDataset with stored basis information
-        u0_callable: Function that takes x (array or tensor) and returns u0(x)
-    
-    Returns:
-        c0_stored: (K,) coefficients in the dataset's storage space
-    """
     if ds.Phi is None:
         raise ValueError("Dataset has no stored basis_matrix (ds.Phi is None).")
     
-    # Check if basis parameters are available
     if not hasattr(ds, 'hermite_scale') or not hasattr(ds, 'hermite_shift'):
         raise ValueError(
             "Dataset missing hermite_scale/hermite_shift. "
@@ -579,47 +584,30 @@ def project_u0_to_c0_stored(ds, u0_callable) -> torch.Tensor:
     dtype = ds.c.dtype
     K = ds.K
     
-    # Get reconstruction grid
     x_grid = ds.get_reconstruction_grid()
-    
-    # Evaluate u0 on the grid
     u0_np = np.asarray(u0_callable(x_grid), dtype=float).reshape(-1)
     if u0_np.shape[0] != x_grid.size:
-        raise ValueError(
-            f"u0(x_grid) must return shape (nx,), got {u0_np.shape} for nx={x_grid.size}"
-        )
+        raise ValueError(f"u0(x_grid) must return shape (nx,), got {u0_np.shape} for nx={x_grid.size}")
     
-    # Quadrature weights
     w_np = trapz_weights_1d(x_grid)
     
-    # Convert to torch
-    u0 = torch.tensor(u0_np, device=device, dtype=dtype)  # (nx,)
-    w = torch.tensor(w_np, device=device, dtype=dtype)    # (nx,)
+    u0 = torch.tensor(u0_np, device=device, dtype=dtype)
+    w = torch.tensor(w_np, device=device, dtype=dtype)
     
-    # Reconstruct the basis at the grid points using stored parameters
     x_torch = torch.tensor(x_grid, device=device, dtype=dtype)
-    Phi_z_original = hermite_basis_x_torch(
-        x_torch, K, 
-        scale=ds.hermite_scale, 
-        shift=ds.hermite_shift
-    )  # (K, nx)
+    Phi_z_original = hermite_basis_x_torch(x_torch, K, scale=ds.hermite_scale, shift=ds.hermite_shift)
     
-    # Apply orthonormalization transformation if it was used
     if hasattr(ds, 'orthonormalize') and ds.orthonormalize:
         if ds.transformation_matrix is None:
             raise ValueError("Dataset was orthonormalized but transformation_matrix is missing!")
         T = torch.as_tensor(ds.transformation_matrix, device=device, dtype=dtype)
-        Phi_z = T @ Phi_z_original  # (K, nx)
+        Phi_z = T @ Phi_z_original
     else:
         Phi_z = Phi_z_original
     
-    # Build projection matrix (same as in burgers_neural_ds)
-    P = (w.unsqueeze(0) * Phi_z).t().contiguous()  # (nx, K)
+    P = (w.unsqueeze(0) * Phi_z).t().contiguous()
+    c0_phys = P.t() @ u0
     
-    # Project: c = P.t() @ u0
-    c0_phys = P.t() @ u0  # (K,)
-    
-    # Handle normalization (stored space)
     if ds.config.normalize_c:
         mean = torch.as_tensor(ds.c_mean, device=device, dtype=dtype).squeeze(0)
         std = torch.as_tensor(ds.c_std, device=device, dtype=dtype).squeeze(0)
@@ -630,19 +618,9 @@ def project_u0_to_c0_stored(ds, u0_callable) -> torch.Tensor:
 
 @torch.no_grad()
 def predict_and_plot_vs_reference_surface(
-    func,
-    ds,
-    u0_callable,
-    t_vals: np.ndarray,
-    z_vals: np.ndarray,
-    X_ref: np.ndarray,
-    method: str = "dopri5",
-    rtol: float = 1e-6,
-    atol: float = 1e-6,
-    ode_options: dict | None = None,
-    notebook_plot: bool = True,
-    # if you trained with whitening (info["transform"]), pass it here:
-    transform: AffineCoeffTransform | None = None,
+    func, ds, u0_callable, t_vals, z_vals, X_ref,
+    method="dopri5", rtol=1e-6, atol=1e-6, ode_options=None,
+    notebook_plot=True, transform=None,
 ):
     device = ds.c.device
 
@@ -650,17 +628,15 @@ def predict_and_plot_vs_reference_surface(
     t_stored = _to_stored_time(ds, t_phys)
     t_stored, _ = torch.sort(t_stored)
 
-    c0_stored = project_u0_to_c0_stored(ds, u0_callable)  # (K,)
+    c0_stored = project_u0_to_c0_stored(ds, u0_callable)
 
-    # If training used whitening in coefficient space, encode IC, rollout, decode back.
     if transform is not None:
         c0_train = transform.encode(c0_stored)
-        c_pred_train = rollout(func, t_stored, c0_train, method=method, rtol=rtol, atol=atol, options=ode_options)
+        c_pred_train = rollout(func, t_stored, c0_train, method, rtol, atol, ode_options)
         c_pred_stored = transform.decode(c_pred_train)
     else:
-        c_pred_stored = rollout(func, t_stored, c0_stored, method=method, rtol=rtol, atol=atol, options=ode_options)
+        c_pred_stored = rollout(func, t_stored, c0_stored, method, rtol, atol, ode_options)
 
-    # reconstruct (dataset handles ds.config.normalize_c inside reconstruct_u)
     U_pred_tx = ds.reconstruct_u(c_pred_stored, denormalize=True)
     U_pred_tx_np = U_pred_tx.detach().cpu().numpy()
 
@@ -687,18 +663,10 @@ def predict_and_plot_vs_reference_surface(
 
 @torch.no_grad()
 def predict(
-    func: nn.Module,
-    dataset,
-    ic_idx: int = 0,
-    t_eval: torch.Tensor | None = None,
-    method: str = "dopri5",
-    rtol: float = 1e-6,
-    atol: float = 1e-6,
-    ode_options: dict | None = None,
-    reconstruct: bool = True,
-    compare_ground_truth: bool = True,
-    plot: bool = True,
-    transform: AffineCoeffTransform | None = None,
+    func, dataset, ic_idx=0, t_eval=None,
+    method="dopri5", rtol=1e-6, atol=1e-6, ode_options=None,
+    reconstruct=True, compare_ground_truth=True, plot=True,
+    transform=None,
 ):
     func.eval()
     device = dataset.c.device
@@ -712,15 +680,14 @@ def predict(
 
     t_eval, order = torch.sort(t_eval)
     c_true = c_true[order]
-
-    c0 = c_true[0]  # (K,)
+    c0 = c_true[0]
 
     if transform is not None:
         c0_train = transform.encode(c0)
-        c_pred_train = rollout(func, t_eval, c0_train, method=method, rtol=rtol, atol=atol, options=ode_options)
+        c_pred_train = rollout(func, t_eval, c0_train, method, rtol, atol, ode_options)
         c_pred = transform.decode(c_pred_train)
     else:
-        c_pred = rollout(func, t_eval, c0, method=method, rtol=rtol, atol=atol, options=ode_options)
+        c_pred = rollout(func, t_eval, c0, method, rtol, atol, ode_options)
 
     results = {"t": t_eval.detach().cpu(), "c_pred": c_pred.detach().cpu()}
 
@@ -762,7 +729,7 @@ def predict(
     return results
 
 
-def _plot_predictions(results: dict, reconstruct: bool, compare_ground_truth: bool):
+def _plot_predictions(results, reconstruct, compare_ground_truth):
     from plotly.subplots import make_subplots
 
     t_phys = results["t_phys"].numpy()
@@ -807,8 +774,7 @@ def _plot_predictions(results: dict, reconstruct: bool, compare_ground_truth: bo
             error = np.abs(u_pred - u_true)
 
             fig3 = make_subplots(
-                rows=1,
-                cols=3,
+                rows=1, cols=3,
                 subplot_titles=("Prediction", "Ground Truth", "Absolute Error"),
                 horizontal_spacing=0.1,
             )
@@ -818,54 +784,3 @@ def _plot_predictions(results: dict, reconstruct: bool, compare_ground_truth: bo
 
             fig3.update_layout(title="Spatiotemporal Solution", height=400, showlegend=False)
             fig3.show()
-        else:
-            fig3 = go.Figure(data=go.Heatmap(z=u_pred.T, x=t_phys, y=x_grid, colorscale="RdBu"))
-            fig3.update_layout(title="Spatiotemporal Solution (Prediction)", xaxis_title="Time", yaxis_title="x", height=400)
-            fig3.show()
-
-
-# -----------------------------
-# Example main
-# -----------------------------
-if __name__ == "__main__":
-    from pde_dataset.neural_galerkin_dataset import NeuralGalerkinDataset
-
-    ds = NeuralGalerkinDataset.load(
-        filepath="burger_eq/neural_galerkin_ds.npz",
-        device="cuda",
-        dtype=torch.float32,
-    )
-
-    func, info = train_neural_ode_on_neural_galerkin_dataset(
-        ds=ds,
-        epochs=2000,
-        lr=1e-3,
-        hidden=256,
-        time_dependent=True,
-        method="dopri5",
-        batch_ics=64,
-        time_subsample=150,
-        print_every=100,
-        ode_options=None,
-        whiten_if_needed=True,
-        pretrain_derivative=True,
-        pretrain_epochs=200,
-        pretrain_lr=1e-3,
-    )
-
-    results = predict(
-        func=func,
-        dataset=ds,
-        ic_idx=0,
-        method="dopri5",
-        reconstruct=True,
-        compare_ground_truth=True,
-        plot=True,
-        transform=info["transform"],
-    )
-
-    print("\nPrediction completed!")
-    print(f"Time points: {results['t'].shape}")
-    print(f"Predicted coefficients: {results['c_pred'].shape}")
-    if "u_pred" in results:
-        print(f"Reconstructed spatial solution: {results['u_pred'].shape}")

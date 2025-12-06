@@ -292,7 +292,7 @@ def burgers_neural_ds(
         pde_name="burgers",
     )
     
-    return NeuralGalerkinDataset(
+    ds = NeuralGalerkinDataset(
         config=cfg,
         t=T_all,
         c=C_all,
@@ -301,6 +301,14 @@ def burgers_neural_ds(
         x_grid=z_vals,
         basis_matrix=Phi_np,
     )
+    
+    # Store basis parameters for projection of arbitrary ICs
+    ds.hermite_scale = float(scale)
+    ds.hermite_shift = float(shift)
+    ds.orthonormalize = bool(orthonormalize)
+    ds.transformation_matrix = T.detach().cpu().numpy() if orthonormalize else None
+    
+    return ds
 
 
 if __name__ == "__main__":

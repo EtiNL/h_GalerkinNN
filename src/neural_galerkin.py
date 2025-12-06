@@ -514,35 +514,81 @@ def rollout(
 
 @torch.no_grad()
 def project_u0_to_c0_stored(ds, u0_callable) -> torch.Tensor:
+    """
+    Project arbitrary initial condition onto the dataset's basis.
+    
+    This correctly handles:
+    - Scaled and shifted Hermite basis
+    - Orthonormalized basis (if used during dataset generation)
+    - Proper quadrature weights
+    
+    Args:
+        ds: NeuralGalerkinDataset with stored basis information
+        u0_callable: Function that takes x (array or tensor) and returns u0(x)
+    
+    Returns:
+        c0_stored: (K,) coefficients in the dataset's storage space
+    """
     if ds.Phi is None:
         raise ValueError("Dataset has no stored basis_matrix (ds.Phi is None).")
-
-    x_grid = ds.get_reconstruction_grid()
-    u0_np = np.asarray(u0_callable(x_grid), dtype=float).reshape(-1)
-    if u0_np.shape[0] != x_grid.size:
-        raise ValueError(f"u0(x_grid) must return shape (nx,), got {u0_np.shape} for nx={x_grid.size}")
-
-    w_np = trapz_weights_1d(x_grid)
-
+    
+    # Check if basis parameters are available
+    if not hasattr(ds, 'hermite_scale') or not hasattr(ds, 'hermite_shift'):
+        raise ValueError(
+            "Dataset missing hermite_scale/hermite_shift. "
+            "Re-generate dataset with updated burgers_neural_ds function."
+        )
+    
     device = ds.c.device
     dtype = ds.c.dtype
+    K = ds.K
     
-    # Load orthonormalized basis (same as Phi_z during generation)
-    Phi_z = torch.as_tensor(ds.Phi, device=device, dtype=dtype)  # (K, nx)
-    u0 = torch.tensor(u0_np, device=device, dtype=dtype)         # (nx,)
-    w = torch.tensor(w_np, device=device, dtype=dtype)           # (nx,)
-
+    # Get reconstruction grid
+    x_grid = ds.get_reconstruction_grid()
+    
+    # Evaluate u0 on the grid
+    u0_np = np.asarray(u0_callable(x_grid), dtype=float).reshape(-1)
+    if u0_np.shape[0] != x_grid.size:
+        raise ValueError(
+            f"u0(x_grid) must return shape (nx,), got {u0_np.shape} for nx={x_grid.size}"
+        )
+    
+    # Quadrature weights
+    w_np = trapz_weights_1d(x_grid)
+    
+    # Convert to torch
+    u0 = torch.tensor(u0_np, device=device, dtype=dtype)  # (nx,)
+    w = torch.tensor(w_np, device=device, dtype=dtype)    # (nx,)
+    
+    # Reconstruct the basis at the grid points using stored parameters
+    x_torch = torch.tensor(x_grid, device=device, dtype=dtype)
+    Phi_z_original = hermite_basis_x_torch(
+        x_torch, K, 
+        scale=ds.hermite_scale, 
+        shift=ds.hermite_shift
+    )  # (K, nx)
+    
+    # Apply orthonormalization transformation if it was used
+    if hasattr(ds, 'orthonormalize') and ds.orthonormalize:
+        if ds.transformation_matrix is None:
+            raise ValueError("Dataset was orthonormalized but transformation_matrix is missing!")
+        T = torch.as_tensor(ds.transformation_matrix, device=device, dtype=dtype)
+        Phi_z = T @ Phi_z_original  # (K, nx)
+    else:
+        Phi_z = Phi_z_original
+    
+    # Build projection matrix (same as in burgers_neural_ds)
     P = (w.unsqueeze(0) * Phi_z).t().contiguous()  # (nx, K)
     
     # Project: c = P.t() @ u0
     c0_phys = P.t() @ u0  # (K,)
-
-    # Handle normalization
+    
+    # Handle normalization (stored space)
     if ds.config.normalize_c:
         mean = torch.as_tensor(ds.c_mean, device=device, dtype=dtype).squeeze(0)
         std = torch.as_tensor(ds.c_std, device=device, dtype=dtype).squeeze(0)
         return (c0_phys - mean) / std
-
+    
     return c0_phys
 
 

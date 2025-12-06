@@ -307,6 +307,16 @@ def burgers_neural_ds(
     ds.hermite_shift = float(shift)
     ds.orthonormalize = bool(orthonormalize)
     ds.transformation_matrix = T.detach().cpu().numpy() if orthonormalize else None
+
+    T_all = t_target.detach().cpu().numpy()[None, :].repeat(N, axis=0)  # Should be (N, nT)
+    C_all = C_target.detach().cpu().numpy()  # Should be (N, nT, K)
+
+    print(f"T_all shape before dataset creation: {T_all.shape}")
+    print(f"C_all shape before dataset creation: {C_all.shape}")
+
+    # ✅ Verify shapes
+    assert T_all.shape == (N, n_time_samples), f"T_all wrong shape: {T_all.shape}"
+    assert C_all.shape == (N, n_time_samples, K), f"C_all wrong shape: {C_all.shape}"
     
     return ds
 

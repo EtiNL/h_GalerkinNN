@@ -47,13 +47,47 @@ class CoeffODEFunc(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, t, c):
-        # Keep solver time possibly float64, but do NOT push float64 through the NN.
+        """
+        t: scalar () or (B,)
+        c: (K,) or (B,K)
+
+        - torchdiffeq case: t is scalar, c is (B,K) or (K,)
+        - derivative pretrain: t can be (B,), c is (B,K)
+        """
+        # Ensure c is at least 2D: (B,K)
+        squeeze_back = False
+        if c.ndim == 1:
+            c = c.unsqueeze(0)      # (1,K)
+            squeeze_back = True     # remember to squeeze at the end
+
+        B = c.shape[0]
+
         if self.time_dependent:
-            tt = t.to(dtype=c.dtype, device=c.device).expand(c.shape[0], 1)  # (B,1)
-            x = torch.cat([c, tt], dim=1)
+            t = t.to(device=c.device)  # keep dtype float64 if needed for solver
+
+            if t.ndim == 0:
+                # scalar time: broadcast to batch
+                tt = t.to(dtype=c.dtype).expand(B, 1)  # (B,1)
+            elif t.ndim == 1:
+                # batched time: t.shape[0] should be 1 or B
+                if t.shape[0] == 1:
+                    tt = t.to(dtype=c.dtype).expand(B, 1)
+                else:
+                    assert t.shape[0] == B, \
+                        f"Time batch size {t.shape[0]} != state batch size {B}"
+                    tt = t.to(dtype=c.dtype).view(B, 1)
+            else:
+                raise ValueError(f"Unsupported time tensor shape {t.shape} (expected () or (B,)).")
+
+            x = torch.cat([c, tt], dim=1)  # (B, K+1)
         else:
             x = c
-        return self.net(x)
+
+        out = self.net(x)  # (B,K)
+        if squeeze_back:
+            out = out.squeeze(0)  # return (K,) if input was (K,)
+        return out
+
 
 
 # -----------------------------

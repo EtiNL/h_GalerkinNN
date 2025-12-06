@@ -413,42 +413,49 @@ def train_neural_ode_on_neural_galerkin_dataset(
 
             tot += float(loss.detach().item()) * len(b_ids)
             n += len(b_ids)
+            
+            # ✅ Clean up batch tensors
+            del cB, loss
 
         train_mse = tot / max(1, n)
         train_curve.append(train_mse)
 
         # Step scheduler once per epoch
         if scheduler is not None:
-            if lr_schedule == "plateau" and len(val_ids) > 0:
-                # Plateau scheduler uses validation loss
-                val_mse = eval_mse_ode(func, t_shared, C_train_space, val_ids, batch_ics, method, rtol, atol, ode_options)
-                scheduler.step(val_mse)
+            if lr_schedule == "plateau":
+                # For plateau, we need validation loss but only compute it periodically
+                pass  # Will handle below
             else:
                 scheduler.step()
 
-        # Validation and early stopping
-        if len(val_ids) > 0:
-            val_mse = eval_mse_ode(func, t_shared, C_train_space, val_ids, batch_ics, method, rtol, atol, ode_options)
+        # ✅ Validation ONLY every print_every epochs to save memory
+        if len(val_ids) > 0 and (ep % print_every == 0 or ep == epochs):
+            val_batch = min(32, batch_ics)  # ✅ Smaller batch for validation
+            val_mse = eval_mse_ode(func, t_shared, C_train_space, val_ids, val_batch, method, rtol, atol, ode_options)
             val_curve.append(val_mse)
             
+            # Update plateau scheduler if using it
+            if scheduler is not None and lr_schedule == "plateau":
+                scheduler.step(val_mse)
+            
             # Print progress
-            if ep % print_every == 0 or ep == epochs:
-                current_lr = opt.param_groups[0]['lr']
-                gap = train_mse - val_mse
-                print(f"Epoch {ep}/{epochs} | Train: {train_mse:.6e} | Val: {val_mse:.6e} | "
-                      f"Gap: {gap:+.6e} | LR: {current_lr:.6e} | Patience: {patience_counter}/{early_stopping_patience}")
+            current_lr = opt.param_groups[0]['lr']
+            gap = train_mse - val_mse
+            print(f"Epoch {ep}/{epochs} | Train: {train_mse:.6e} | Val: {val_mse:.6e} | "
+                f"Gap: {gap:+.6e} | LR: {current_lr:.6e} | Patience: {patience_counter}/{early_stopping_patience}")
             
             # ✅ Early stopping logic
             if val_mse < best_val_loss - early_stopping_min_delta:
                 best_val_loss = val_mse
                 best_epoch = ep
                 patience_counter = 0
-                # Save best model state
                 best_state = {k: v.cpu().clone() for k, v in func.state_dict().items()}
-                if ep % print_every == 0:
-                    print(f"  ✅ New best model! Val MSE: {best_val_loss:.6e}")
+                print(f"  ✅ New best model! Val MSE: {best_val_loss:.6e}")
             else:
                 patience_counter += 1
+            
+            # ✅ Clear GPU cache after validation
+            torch.cuda.empty_cache()
             
             # Check early stopping
             if patience_counter >= early_stopping_patience:

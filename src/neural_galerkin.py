@@ -430,6 +430,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
 
         # ✅ Validation ONLY every print_every epochs to save memory
         if len(val_ids) > 0 and (ep % print_every == 0 or ep == epochs):
+            print('val computation')
             val_batch = min(32, batch_ics)  # ✅ Smaller batch for validation
             val_mse = eval_mse_ode(func, t_shared, C_train_space, val_ids, val_batch, method, rtol, atol, ode_options)
             val_curve.append(val_mse)

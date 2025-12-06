@@ -189,7 +189,9 @@ def burgers_neural_ds(
         P=P,
         z_batch_size=z_batch_size,
         compute_G_if_missing=True,
-    )
+        interp="cubic",
+    enforce_exact_ic=True,
+)
 
     # time grid -> target times (make "random" strictly increasing to avoid dt=0)
     t_grid = torch.tensor(t_vals, device=device, dtype=dtype)

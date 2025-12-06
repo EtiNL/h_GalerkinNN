@@ -429,7 +429,8 @@ def train_neural_ode_on_neural_galerkin_dataset(
         scheduler = torch.optim.lr_scheduler.StepLR(
             opt, step_size=epochs//3, gamma=0.5
         )
-    
+    else:
+        scheduler = None
 
     train_curve = []
     val_curve = []
@@ -455,10 +456,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
             if grad_clip is not None:
                 nn.utils.clip_grad_norm_(func.parameters(), grad_clip)
             
-            if lr_schedule == "plateau":
-                scheduler.step(train_mse)
-            else:
-                scheduler.step()
+            opt.step()  # ✅ Just step the optimizer
 
             tot += float(loss.detach().item()) * len(b_ids)
             n += len(b_ids)
@@ -466,9 +464,20 @@ def train_neural_ode_on_neural_galerkin_dataset(
         train_mse = tot / max(1, n)
         train_curve.append(train_mse)
 
+        # ✅ Step scheduler ONCE per epoch AFTER computing train_mse
+        if scheduler is not None:
+            if lr_schedule == "plateau":
+                scheduler.step(train_mse)
+            else:
+                scheduler.step()
+
         if (ep % print_every == 0 or ep == epochs) and len(val_ids) > 0:
             val_mse = eval_mse_ode(func, t_shared, C_train_space, val_ids, batch_ics, method, rtol, atol, ode_options)
             val_curve.append(val_mse)
+            
+            # ✅ Print current LR
+            current_lr = opt.param_groups[0]['lr']
+            print(f"Epoch {ep}/{epochs} | Train MSE: {train_mse:.6e} | Val MSE: {val_mse:.6e} | LR: {current_lr:.6e}")
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(y=train_curve, mode="lines", name="train"))

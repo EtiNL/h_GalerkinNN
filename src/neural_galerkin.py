@@ -388,10 +388,8 @@ def train_neural_ode_on_neural_galerkin_dataset(
     # Optional whitening if dataset is not already normalized
     transform = None
     if whiten_if_needed and not ds.config.normalize_c:
-        mean = torch.as_tensor(ds.c_mean, device=device, dtype=ds.c.dtype).squeeze(0)  # (K,)
-        std = torch.as_tensor(ds.c_std, device=device, dtype=ds.c.dtype).squeeze(0)    # (K,)
-        # avoid pathological zeros
-        std = torch.clamp(std, min=torch.finfo(std.dtype).eps)
+        mean = torch.as_tensor(ds.c_mean, ...).squeeze(0)  # (K,)
+        std  = torch.as_tensor(ds.c_std,  ...).squeeze(0)  # (K,)
         transform = AffineCoeffTransform(mean, std)
         C_train_space = transform.encode(C_all)
     else:

@@ -362,7 +362,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
     split_seed: int = 0,
     epochs: int = 2000,
     lr: float = 1e-3,
-    hidden: int = 256,
+    hidden: int = 512,
     time_dependent: bool = True,
     method: str = "dopri5",
     rtol: float = 1e-6,
@@ -370,14 +370,17 @@ def train_neural_ode_on_neural_galerkin_dataset(
     batch_ics: int = 64,                  # avoid near-full-batch; helps learning
     time_subsample: int | None = 150,     # train-time speedup
     grad_clip: float = 1.0,
-    print_every: int = 50,
+    print_every: int = 5,
     ode_options: dict | None = None,
     # Stabilizers:
     whiten_if_needed: bool = True,        # affine whitening if ds.normalize_c=False
     # Warm-start:
     pretrain_derivative: bool = True,
-    pretrain_epochs: int = 200,
+    pretrain_epochs: int = 10,
     pretrain_lr: float = 1e-3,
+    # lr-scheduler
+    lr_schedule: str = "cosine",  # or "plateau" or "step"
+    lr_min: float = 1e-5,
 ):
     device = ds.c.device
     M, _, K = ds.c.shape
@@ -413,6 +416,20 @@ def train_neural_ode_on_neural_galerkin_dataset(
         )
 
     opt = torch.optim.Adam(func.parameters(), lr=lr)
+    
+    if lr_schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=epochs, eta_min=lr_min
+        )
+    elif lr_schedule == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode='min', factor=0.5, patience=50, verbose=True
+        )
+    elif lr_schedule == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            opt, step_size=epochs//3, gamma=0.5
+        )
+    
 
     train_curve = []
     val_curve = []
@@ -437,7 +454,11 @@ def train_neural_ode_on_neural_galerkin_dataset(
 
             if grad_clip is not None:
                 nn.utils.clip_grad_norm_(func.parameters(), grad_clip)
-            opt.step()
+            
+            if lr_schedule == "plateau":
+                scheduler.step(train_mse)
+            else:
+                scheduler.step()
 
             tot += float(loss.detach().item()) * len(b_ids)
             n += len(b_ids)

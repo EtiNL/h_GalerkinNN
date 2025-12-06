@@ -511,6 +511,33 @@ def rollout(
     c_pred = odeint_fwd(func, c0, t_stored, method=method, rtol=rtol, atol=atol, options=options)
     return c_pred.squeeze(1)  # (nT,K)
 
+@torch.no_grad()
+def hermite_basis_x_torch(x: torch.Tensor, K: int, scale: float, shift: float) -> torch.Tensor:
+    """
+    Stable Hermite functions basis (orthonormal in L²(ℝ)) with scaling.
+    Returns: (K, nx) tensor where Phi[k, :] is the k-th basis function.
+    """
+    y = (x - shift) / scale
+    y_flat = y.reshape(-1)
+    M = y_flat.numel()
+    
+    yd = y_flat.to(torch.float64)
+    Phi = torch.empty((K, M), device=x.device, dtype=torch.float64)
+    
+    phi0 = (math.pi ** (-0.25)) * torch.exp(-0.5 * yd * yd)
+    Phi[0] = phi0
+    
+    if K >= 2:
+        Phi[1] = math.sqrt(2.0) * yd * phi0
+    
+    for k in range(1, K - 1):
+        a = math.sqrt(2.0 / (k + 1))
+        b = math.sqrt(k / (k + 1))
+        Phi[k + 1] = a * yd * Phi[k] - b * Phi[k - 1]
+    
+    Phi = Phi.reshape(K, *y.shape).to(dtype=x.dtype)
+    return Phi / math.sqrt(scale)
+
 
 @torch.no_grad()
 def project_u0_to_c0_stored(ds, u0_callable) -> torch.Tensor:

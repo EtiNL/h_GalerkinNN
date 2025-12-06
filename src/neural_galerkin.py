@@ -526,12 +526,18 @@ def project_u0_to_c0_stored(ds, u0_callable) -> torch.Tensor:
 
     device = ds.c.device
     dtype = ds.c.dtype
-    u0 = torch.tensor(u0_np, device=device, dtype=dtype)
-    w = torch.tensor(w_np, device=device, dtype=dtype)
+    
+    # Load orthonormalized basis (same as Phi_z during generation)
+    Phi_z = torch.as_tensor(ds.Phi, device=device, dtype=dtype)  # (K, nx)
+    u0 = torch.tensor(u0_np, device=device, dtype=dtype)         # (nx,)
+    w = torch.tensor(w_np, device=device, dtype=dtype)           # (nx,)
 
-    c0_phys = ds.Phi @ (w * u0)  # (K,)
+    P = (w.unsqueeze(0) * Phi_z).t().contiguous()  # (nx, K)
+    
+    # Project: c = P.t() @ u0
+    c0_phys = P.t() @ u0  # (K,)
 
-    # stored space depends on ds.config.normalize_c
+    # Handle normalization
     if ds.config.normalize_c:
         mean = torch.as_tensor(ds.c_mean, device=device, dtype=dtype).squeeze(0)
         std = torch.as_tensor(ds.c_std, device=device, dtype=dtype).squeeze(0)

@@ -512,7 +512,6 @@ def train_neural_ode_on_neural_galerkin_dataset(
         "final_train_loss": train_curve[best_epoch-1] if best_epoch > 0 else train_curve[-1],
         "config": {
             "hidden": hidden,
-            "dropout": dropout,
             "weight_decay": weight_decay,
             "lr": lr,
             "early_stopping_patience": early_stopping_patience,

@@ -450,8 +450,8 @@ def train_neural_ode_on_neural_galerkin_dataset(
                 best_val_loss = val_mse
                 best_epoch = ep
                 patience_counter = 0
-                best_state = {k: v.cpu().clone() for k, v in func.state_dict().items()}
-                print(f"  ✅ New best model! Val MSE: {best_val_loss:.6e}")
+                # best_state = {k: v.cpu().clone() for k, v in func.state_dict().items()}
+                # print(f"  ✅ New best model! Val MSE: {best_val_loss:.6e}")
             else:
                 patience_counter += 1
             

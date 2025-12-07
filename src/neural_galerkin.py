@@ -440,7 +440,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
                 best_state = {k: v.cpu().clone() for k, v in func.state_dict().items()}
                 print(f"  New best model! Val MSE: {best_val_loss:.6e}")
             else:
-                patience_counter += 1
+                patience_counter += print_every
             
             # Check early stopping
             if patience_counter >= early_stopping_patience:

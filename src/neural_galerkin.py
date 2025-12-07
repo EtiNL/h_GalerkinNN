@@ -427,8 +427,8 @@ def train_neural_ode_on_neural_galerkin_dataset(
             # Print progress
             current_lr = opt.param_groups[0]['lr']
             gap = train_mse - val_mse
-            print(f"Epoch {ep}/{epochs} | Train: {train_mse:.6e} | Val: {val_mse:.6e} | "
-                f"                  Gap: {gap:+.6e} \n | LR: {current_lr:.6e} | Patience: {patience_counter}/{early_stopping_patience}")
+            print(f"\n Train: {train_mse:.6e} | Val: {val_mse:.6e} | "
+                f"Gap: {gap:+.6e} | LR: {current_lr:.6e} | Patience: {patience_counter}/{early_stopping_patience}")
             
             # Early stopping logic
             if val_mse < best_val_loss - early_stopping_min_delta:

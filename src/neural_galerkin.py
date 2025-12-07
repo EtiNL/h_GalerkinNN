@@ -369,6 +369,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
     # Early stopping variables
     train_curve = []
     val_curve = []
+    val_epochs = []
     best_val_loss = float('inf')
     best_epoch = 0
     patience_counter = 0
@@ -416,9 +417,10 @@ def train_neural_ode_on_neural_galerkin_dataset(
 
         # Validation ONLY every print_every epochs to save memory
         if len(val_ids) > 0 and ((ep-1) % print_every == 0 or ep == epochs):
-            val_batch = min(64, batch_ics)  # Smaller batch for validation
+            val_batch = min(64, batch_ics)
             val_mse = eval_mse_ode(func, t_shared, C_train_space, val_ids, val_batch, method, rtol, atol, ode_options)
             val_curve.append(val_mse)
+            val_epochs.append(ep)
             
             # Update plateau scheduler if using it
             if scheduler is not None and lr_schedule == "plateau":
@@ -465,12 +467,16 @@ def train_neural_ode_on_neural_galerkin_dataset(
     
     if len(val_curve) > 0:
         # Validation is computed every epoch now
-        fig.add_trace(go.Scatter(y=val_curve, mode="lines", name="val", line=dict(width=2)))
+        fig.add_trace(go.Scatter(x=val_epochs,
+                                y=val_curve, 
+                                mode="lines+markers",
+                                name="val", 
+                                line=dict(width=2)))
         
         # Mark best epoch
         if best_epoch > 0:
             fig.add_vline(
-                x=best_epoch - 1, 
+                x=best_epoch,  # ✅ Correct: use actual epoch number
                 line_dash="dash", 
                 line_color="green",
                 annotation_text=f"Best (epoch {best_epoch})",
@@ -483,7 +489,8 @@ def train_neural_ode_on_neural_galerkin_dataset(
             overfit_region = val_curve[best_idx:] if best_idx < len(val_curve) - 1 else []
             if len(overfit_region) > 5:
                 fig.add_vrect(
-                    x0=best_idx, x1=len(val_curve)-1,
+                    x0=val_epochs[best_idx],  # ✅ Correct: use actual epoch number
+                    x1=val_epochs[-1],  # ✅ Correct: use last validation epoch
                     fillcolor="red", opacity=0.1,
                     annotation_text="Overfitting region",
                     annotation_position="top right"
@@ -504,6 +511,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
         "val_ids": val_ids,
         "train_curve": train_curve,
         "val_curve": val_curve,
+        "val_epochs": val_epochs,
         "t_shared": t_shared,
         "transform": transform,
         "time_subsample": time_subsample,

@@ -283,12 +283,6 @@ def burgers_neural_ds(
     C_all = C_target.detach().cpu().numpy()  # (N, nT, K)
     Phi_np = Phi_z.detach().cpu().numpy()
     
-    # ✅ DEBUG: Verify shapes BEFORE creating dataset
-    print(f"T_all shape before dataset creation: {T_all.shape}")
-    print(f"C_all shape before dataset creation: {C_all.shape}")
-    assert T_all.shape == (N, n_time_samples), f"T_all wrong shape: {T_all.shape}"
-    assert C_all.shape == (N, n_time_samples, K), f"C_all wrong shape: {C_all.shape}"
-    
     cfg = NeuralGalerkinDatasetConfig(
         n_time_samples=int(T_all.shape[1]),
         t_sampling=t_sampling,
@@ -309,23 +303,11 @@ def burgers_neural_ds(
         basis_matrix=Phi_np,
     )
     
-    # ✅ DEBUG: Check shapes AFTER creating dataset
-    print(f"Dataset t shape after creation: {ds.t.shape}")
-    print(f"Dataset c shape after creation: {ds.c.shape}")
-    
     # Store basis parameters for projection of arbitrary ICs
     ds.hermite_scale = float(scale)
     ds.hermite_shift = float(shift)
     ds.orthonormalize = bool(orthonormalize)
     ds.transformation_matrix = T.detach().cpu().numpy() if orthonormalize else None
-    
-    # ✅ FIX: Remove extra dimension if present
-    if ds.c.ndim == 4:
-        print("⚠️  WARNING: Extra dimension detected, fixing...")
-        ds.c = ds.c.squeeze(0)
-        ds.t = ds.t.squeeze(0)
-        ds.M = ds.c.shape[0]
-        print(f"Fixed shapes: t={ds.t.shape}, c={ds.c.shape}")
     
     return ds
     

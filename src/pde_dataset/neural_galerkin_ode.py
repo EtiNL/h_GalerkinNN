@@ -119,7 +119,7 @@ class NeuralGalerkinDataset(Dataset):
         if config.normalize_t:
             t = (t - self.t_mean) / self.t_std
         if config.normalize_c:
-            c = (c - self.c_mean[None, None, :]) / self.c_std[None, None, :]
+            c = (c - self.c_mean) / self.c_std
 
         self.t = torch.tensor(t, device=device, dtype=torch.float64)
         self.c = torch.tensor(c, device=device, dtype=dtype)

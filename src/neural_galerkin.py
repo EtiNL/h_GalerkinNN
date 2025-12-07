@@ -415,7 +415,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
                 scheduler.step()
 
         # Validation ONLY every print_every epochs to save memory
-        if len(val_ids) > 0 and (ep-1 % print_every == 0 or ep == epochs):
+        if len(val_ids) > 0 and ((ep-1) % print_every == 0 or ep == epochs):
             val_batch = min(64, batch_ics)  # Smaller batch for validation
             val_mse = eval_mse_ode(func, t_shared, C_train_space, val_ids, val_batch, method, rtol, atol, ode_options)
             val_curve.append(val_mse)
@@ -428,7 +428,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
             current_lr = opt.param_groups[0]['lr']
             gap = train_mse - val_mse
             print(f"Epoch {ep}/{epochs} | Train: {train_mse:.6e} | Val: {val_mse:.6e} | "
-                f"Gap: {gap:+.6e} | LR: {current_lr:.6e} | Patience: {patience_counter}/{early_stopping_patience}")
+                f"Gap: {gap:+.6e} \n | LR: {current_lr:.6e} | Patience: {patience_counter}/{early_stopping_patience}")
             
             # Early stopping logic
             if val_mse < best_val_loss - early_stopping_min_delta:
@@ -436,17 +436,14 @@ def train_neural_ode_on_neural_galerkin_dataset(
                 best_epoch = ep
                 patience_counter = 0
                 best_state = {k: v.cpu().clone() for k, v in func.state_dict().items()}
-                print(f"  ✅ New best model! Val MSE: {best_val_loss:.6e}")
+                print(f"  New best model! Val MSE: {best_val_loss:.6e}")
             else:
                 patience_counter += 1
-            
-            # Clear GPU cache after validation
-            # torch.cuda.empty_cache()
             
             # Check early stopping
             if patience_counter >= early_stopping_patience:
                 print(f"\n{'='*60}")
-                print(f"✅ EARLY STOPPING at epoch {ep}")
+                print(f"EARLY STOPPING at epoch {ep}")
                 print(f"Best validation loss: {best_val_loss:.6e} at epoch {best_epoch}")
                 print(f"{'='*60}")
                 break

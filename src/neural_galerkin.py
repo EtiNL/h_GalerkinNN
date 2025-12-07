@@ -28,7 +28,6 @@ class CoeffODEFunc(nn.Module):
     def __init__(self, K: int, hidden: int = 256, time_dependent: bool = True):
         super().__init__()
         self.time_dependent = time_dependent
-        self.dropout = dropout
         inp = K + (1 if time_dependent else 0)
         
         layers = []

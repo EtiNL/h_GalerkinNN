@@ -25,7 +25,7 @@ from plot_utils import plot_sim_result
 # Model with Dropout Support
 # -----------------------------
 class CoeffODEFunc(nn.Module):
-    def __init__(self, K: int, hidden: int = 256, time_dependent: bool = True, dropout: float = 0.0):
+    def __init__(self, K: int, hidden: int = 256, time_dependent: bool = True):
         super().__init__()
         self.time_dependent = time_dependent
         self.dropout = dropout
@@ -34,14 +34,8 @@ class CoeffODEFunc(nn.Module):
         layers = []
         layers.append(nn.Linear(inp, hidden))
         layers.append(nn.Tanh())
-        if dropout > 0:
-            layers.append(nn.Dropout(dropout))
-        
         layers.append(nn.Linear(hidden, hidden))
         layers.append(nn.Tanh())
-        if dropout > 0:
-            layers.append(nn.Dropout(dropout))
-        
         layers.append(nn.Linear(hidden, K))
         
         self.net = nn.Sequential(*layers)
@@ -292,10 +286,8 @@ def train_neural_ode_on_neural_galerkin_dataset(
     val_frac: float = 0.25,
     split_seed: int = 0,
     epochs: int = 2000,
-    lr: float = 1e-3,
-    weight_decay: float = 1e-5,  # ✅ L2 regularization
+    weight_decay: float = 1e-5,
     hidden: int = 256,
-    dropout: float = 0.1,  # ✅ Dropout
     time_dependent: bool = True,
     method: str = "dopri5",
     rtol: float = 1e-6,
@@ -303,7 +295,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
     batch_ics: int = 64,
     time_subsample: int | None = 150,
     grad_clip: float = 1.0,
-    print_every: int = 50,
+    print_every: int = 10,
     ode_options: dict | None = None,
     # Stabilizers
     whiten_if_needed: bool = True,
@@ -313,9 +305,10 @@ def train_neural_ode_on_neural_galerkin_dataset(
     pretrain_lr: float = 1e-3,
     # LR scheduler
     lr_schedule: str = "cosine",
+    lr: float = 1e-3,
     lr_min: float = 1e-6,
-    # ✅ Early stopping
-    early_stopping_patience: int = 150,
+    # Early stopping
+    early_stopping_patience: int = 20,
     early_stopping_min_delta: float = 1e-7,
 ):
     device = ds.c.device
@@ -336,15 +329,13 @@ def train_neural_ode_on_neural_galerkin_dataset(
 
     train_ids, val_ids = _split_indices(M, val_frac=val_frac, seed=split_seed)
 
-    # ✅ Create model with dropout support
-    func = CoeffODEFunc(K, hidden=hidden, time_dependent=time_dependent, dropout=dropout).to(device)
+    func = CoeffODEFunc(K, hidden=hidden, time_dependent=time_dependent).to(device)
     
     print(f"\n{'='*60}")
     print("MODEL CONFIGURATION")
     print(f"{'='*60}")
     print(f"Parameters: {sum(p.numel() for p in func.parameters()):,}")
     print(f"Hidden size: {hidden}")
-    print(f"Dropout: {dropout}")
     print(f"Weight decay: {weight_decay}")
     print(f"Train ICs: {len(train_ids)}, Val ICs: {len(val_ids)}")
 
@@ -361,7 +352,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
             time_batch=min(128, t_shared.numel()),
         )
 
-    # ✅ Optimizer with weight decay
+    # Optimizer with weight decay
     opt = torch.optim.Adam(func.parameters(), lr=lr, weight_decay=weight_decay)
     
     # LR scheduler
@@ -376,7 +367,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
     else:
         scheduler = None
 
-    # ✅ Early stopping variables
+    # Early stopping variables
     train_curve = []
     val_curve = []
     best_val_loss = float('inf')
@@ -413,14 +404,10 @@ def train_neural_ode_on_neural_galerkin_dataset(
 
             tot += float(loss.detach().item()) * len(b_ids)
             n += len(b_ids)
-            
-            # ✅ Clean up batch tensors
-            del cB, loss
 
         train_mse = tot / max(1, n)
         train_curve.append(train_mse)
 
-        # Step scheduler once per epoch
         if scheduler is not None:
             if lr_schedule == "plateau":
                 # For plateau, we need validation loss but only compute it periodically
@@ -428,10 +415,9 @@ def train_neural_ode_on_neural_galerkin_dataset(
             else:
                 scheduler.step()
 
-        # ✅ Validation ONLY every print_every epochs to save memory
-        if len(val_ids) > 0 and (ep % print_every == 0 or ep == epochs):
-            print('val computation')
-            val_batch = min(32, batch_ics)  # ✅ Smaller batch for validation
+        # Validation ONLY every print_every epochs to save memory
+        if len(val_ids) > 0 and (ep-1 % print_every == 0 or ep == epochs):
+            val_batch = min(64, batch_ics)  # Smaller batch for validation
             val_mse = eval_mse_ode(func, t_shared, C_train_space, val_ids, val_batch, method, rtol, atol, ode_options)
             val_curve.append(val_mse)
             
@@ -445,18 +431,18 @@ def train_neural_ode_on_neural_galerkin_dataset(
             print(f"Epoch {ep}/{epochs} | Train: {train_mse:.6e} | Val: {val_mse:.6e} | "
                 f"Gap: {gap:+.6e} | LR: {current_lr:.6e} | Patience: {patience_counter}/{early_stopping_patience}")
             
-            # ✅ Early stopping logic
+            # Early stopping logic
             if val_mse < best_val_loss - early_stopping_min_delta:
                 best_val_loss = val_mse
                 best_epoch = ep
                 patience_counter = 0
-                # best_state = {k: v.cpu().clone() for k, v in func.state_dict().items()}
-                # print(f"  ✅ New best model! Val MSE: {best_val_loss:.6e}")
+                best_state = {k: v.cpu().clone() for k, v in func.state_dict().items()}
+                print(f"  ✅ New best model! Val MSE: {best_val_loss:.6e}")
             else:
                 patience_counter += 1
             
-            # ✅ Clear GPU cache after validation
-            torch.cuda.empty_cache()
+            # Clear GPU cache after validation
+            # torch.cuda.empty_cache()
             
             # Check early stopping
             if patience_counter >= early_stopping_patience:
@@ -471,13 +457,13 @@ def train_neural_ode_on_neural_galerkin_dataset(
                 current_lr = opt.param_groups[0]['lr']
                 print(f"Epoch {ep}/{epochs} | Train: {train_mse:.6e} | LR: {current_lr:.6e}")
     
-    # ✅ Restore best model
+    # Restore best model
     if best_state is not None:
         func.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-        print(f"\n✅ Restored best model from epoch {best_epoch}")
+        print(f"\n Restored best model from epoch {best_epoch}")
         print(f"Final train/val gap: {train_curve[best_epoch-1] - best_val_loss:.6e}")
 
-    # ✅ Enhanced visualization
+    # Enhanced visualization
     fig = go.Figure()
     fig.add_trace(go.Scatter(y=train_curve, mode="lines", name="train", line=dict(width=2)))
     

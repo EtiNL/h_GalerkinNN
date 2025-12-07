@@ -476,7 +476,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
         # Mark best epoch
         if best_epoch > 0:
             fig.add_vline(
-                x=best_epoch,  # ✅ Correct: use actual epoch number
+                x=best_epoch,
                 line_dash="dash", 
                 line_color="green",
                 annotation_text=f"Best (epoch {best_epoch})",
@@ -489,8 +489,8 @@ def train_neural_ode_on_neural_galerkin_dataset(
             overfit_region = val_curve[best_idx:] if best_idx < len(val_curve) - 1 else []
             if len(overfit_region) > 5:
                 fig.add_vrect(
-                    x0=val_epochs[best_idx],  # ✅ Correct: use actual epoch number
-                    x1=val_epochs[-1],  # ✅ Correct: use last validation epoch
+                    x0=val_epochs[best_idx],
+                    x1=val_epochs[-1],
                     fillcolor="red", opacity=0.1,
                     annotation_text="Overfitting region",
                     annotation_position="top right"

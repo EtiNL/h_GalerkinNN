@@ -24,7 +24,7 @@ class CoeffODEFunc(nn.Module):
         time_dependent: If True, concatenate time to input
     """
     
-    def __init__(self, K: int, hidden: int = 256, time_dependent: bool = True):
+    def __init__(self, K: int, hidden: int = 256, time_dependent: bool = True, num_layers: int = 1):
         super().__init__()
         self.time_dependent = time_dependent
         inp = K + (1 if time_dependent else 0)
@@ -32,7 +32,8 @@ class CoeffODEFunc(nn.Module):
         layers = []
         layers.append(nn.Linear(inp, hidden))
         layers.append(nn.Tanh())
-        layers.append(nn.Linear(hidden, hidden))
+        for i in range(num_layers):
+            layers.append(nn.Linear(hidden, hidden))
         layers.append(nn.Tanh())
         layers.append(nn.Linear(hidden, K))
         

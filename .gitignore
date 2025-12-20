@@ -3,3 +3,4 @@
 .ipynb_checkpoints
 **/__pycache__/
 code_to_aggregate.txt
+notebooks/Burger_sim_colab.ipynb

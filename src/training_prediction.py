@@ -965,6 +965,24 @@ def predict_and_plot_vs_reference_surface(
         **({"c_rom_stored": c_rom} if is_hybrid else {}),
     }
 
+@torch.no_grad()
+def eval_hybrid_val_mse(hybrid_model, t_shared, C_all, val_ids,
+                        method="dopri5", rtol=1e-6, atol=1e-6, ode_options=None):
+    device = C_all.device
+    hybrid_model.eval()
+    mse_sum = 0.0
+    n = 0
+    for i in val_ids:
+        c_true = C_all[i]                 # [nT, K]
+        c0 = c_true[0]
+        c_pred = hybrid_model.predict(c0, t_shared, method=method, rtol=rtol, atol=atol,
+                                      options=ode_options, return_components=False)
+        mse_sum += torch.mean((c_pred - c_true) ** 2).item()
+        n += 1
+    return mse_sum / max(1, n)
+
+
+
 
 
 # =====================================================================

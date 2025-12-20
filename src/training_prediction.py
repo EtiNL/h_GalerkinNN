@@ -360,6 +360,121 @@ def train_neural_ode_on_neural_galerkin_dataset(
 # Training: Hybrid ROM + Neural ODE
 # =====================================================================
 
+import torch
+import torch.nn as nn
+from torchdiffeq import odeint as odeint_fwd
+from tqdm import tqdm
+
+
+def _diagnose_rom_consistency(
+    hybrid_model,
+    t_shared,
+    C_all,
+    C_rom_all,
+    method="dopri5",
+    rtol=1e-6,
+    atol=1e-6,
+    ode_options=None,
+    n_check: int = 8,
+):
+    """
+    Compare:
+      (A) precomputed ROM rollout: C_rom_all[i]
+      (B) c_rom extracted from augmented integration with hybrid_model.forward
+          starting at y0=[c0, 0]
+
+    Returns a dict of error stats.
+    """
+    device = C_all.device
+    M, nT, K = C_all.shape
+
+    n_check = min(n_check, M)
+    ids = torch.randperm(M, device=device)[:n_check]
+
+    c0 = C_all[ids, 0, :]                                   # [B, K]
+    y0 = torch.cat([c0, torch.zeros_like(c0)], dim=-1)       # [B, 2K]
+
+    with torch.no_grad():
+        Y = odeint_fwd(
+            hybrid_model.forward, y0, t_shared,
+            method=method, rtol=rtol, atol=atol, options=ode_options
+        ).permute(1, 0, 2)                                   # [B, nT, 2K]
+
+        c_rom_from_aug = Y[..., :K]                          # [B, nT, K]
+        c_rom_precomp = C_rom_all[ids]                       # [B, nT, K]
+
+        diff = c_rom_from_aug - c_rom_precomp
+        abs_diff = diff.abs()
+
+        stats = {
+            "ids": ids.detach().cpu(),
+            "max_abs": float(abs_diff.max().item()),
+            "mean_abs": float(abs_diff.mean().item()),
+            "rmse": float(torch.sqrt(torch.mean(diff ** 2)).item()),
+            "per_ic_max_abs": abs_diff.amax(dim=(1, 2)).detach().cpu(),  # [B]
+        }
+
+    print("\nROM consistency diagnostic (augmented ROM vs precomputed ROM)")
+    print(f"  checked ICs: {n_check}")
+    print(f"  max|diff|   : {stats['max_abs']:.3e}")
+    print(f"  mean|diff|  : {stats['mean_abs']:.3e}")
+    print(f"  RMSE        : {stats['rmse']:.3e}")
+    print(f"  per-IC max|diff|: {stats['per_ic_max_abs'].numpy()}")
+
+    # Heuristic warning threshold (tune if needed)
+    if stats["max_abs"] > 1e-4:
+        print("  ⚠ WARNING: ROM rollouts differ noticeably. "
+              "Residual targets may be inconsistent with model ROM.")
+    else:
+        print("  ✓ ROM rollouts look consistent.")
+
+    return stats
+
+
+
+def _pretrain_residual_derivative_matching(
+    func,                      # predicts dr/dt
+    t: torch.Tensor,           # [nT]
+    C_rom: torch.Tensor,       # [M, nT, K] inputs to func
+    R: torch.Tensor,           # [M, nT, K] residual trajectories
+    train_ids,
+    epochs: int = 10,
+    lr: float = 1e-3,
+    batch_ics: int = 128,
+    time_batch: int = 64,
+):
+    device = C_rom.device
+    opt = torch.optim.Adam(func.parameters(), lr=lr)
+
+    # finite-diff dR/dt
+    dR = torch.empty_like(R)
+    for i in range(R.shape[0]):
+        dR[i] = _finite_difference_dc_dt(t, R[i])
+
+    nT = t.numel()
+    for _ in tqdm(range(1, epochs + 1), desc="Pretrain residual derivative matching"):
+        func.train()
+        opt.zero_grad(set_to_none=True)
+
+        idx_ic = torch.randint(0, len(train_ids), (min(batch_ics, len(train_ids)),), device=device)
+        ic_ids = [train_ids[int(j)] for j in idx_ic.tolist()]
+
+        tidx = torch.randint(0, nT, (time_batch,), device=device)
+        t_s = t[tidx]
+
+        c_rom_s = C_rom[ic_ids][:, tidx, :].reshape(-1, C_rom.shape[2])
+        dR_s    = dR[ic_ids][:, tidx, :].reshape(-1, dR.shape[2])
+
+        tt = t_s.to(dtype=c_rom_s.dtype).repeat(len(ic_ids), 1).reshape(-1)
+        pred = func(tt, c_rom_s)  # dr/dt
+        loss = torch.mean((pred - dR_s) ** 2)
+
+        loss.backward()
+        opt.step()
+
+    return func
+
+
 def train_hybrid_rom_neural_ode(
     neural_ode_func,
     rom_dynamics,
@@ -382,19 +497,27 @@ def train_hybrid_rom_neural_ode(
     lr_schedule: str = "cosine",
     lr_min: float = 1e-6,
     train_on_residuals: bool = True,
-    # >>> added
     pretrain_derivative: bool = True,
     pretrain_epochs: int = 10,
     pretrain_lr: float = 1e-3,
 ):
     """
-    Train Hybrid ROM + Neural ODE.
+    Matches your HybridROMNeuralODE implementation:
+
+      y = [c_rom, r]
+      dc_rom/dt = ROM(t, c_rom)
+      dr/dt     = NN(t, c_rom)
+      c_pred    = c_rom + r
+
+    Dataset layout:
+      C_all: [M, nT, K]
+      t_shared: [nT]
     """
     from hybrid_rom import HybridROMNeuralODE
 
     device = C_all.device
+    M, nT, K = C_all.shape
 
-    # Create hybrid model
     hybrid_model = HybridROMNeuralODE(
         neural_ode_func=neural_ode_func,
         rom_dynamics=rom_dynamics,
@@ -404,100 +527,122 @@ def train_hybrid_rom_neural_ode(
     print(f"\n{'='*70}")
     print("HYBRID ROM + NEURAL ODE TRAINING")
     print(f"{'='*70}")
-    print(f"Neural ODE parameters: {sum(p.numel() for p in neural_ode_func.parameters()):,}")
+    print(f"Neural ODE parameters: {sum(p.numel() for p in hybrid_model.neural_ode.parameters()):,}")
     print(f"Train ICs: {len(train_ids)}, Val ICs: {len(val_ids)}")
 
-    # Compute ROM predictions
-    if train_on_residuals:
+    # ROM trajectories for residual targets / pretraining
+    need_rom = train_on_residuals or (pretrain_derivative and pretrain_epochs > 0)
+
+    C_rom_all = None
+    if need_rom:
         print("\nComputing ROM predictions...")
         with torch.no_grad():
             C_rom_all = torch.zeros_like(C_all)
-            for i in tqdm(range(C_all.shape[0]), desc="ROM baseline"):
+            for i in tqdm(range(M), desc="ROM baseline"):
                 c0 = C_all[i, 0, :]
-                C_rom_all[i] = hybrid_model.get_rom_prediction(c0, t_shared, method=method, rtol=rtol, atol=atol)
+                # ROM.integrate returns [nT, K] (for 1D c0). Ensure it matches C_all[i] layout.
+                C_rom_all[i] = hybrid_model.get_rom_prediction(
+                    c0, t_shared, method=method, rtol=rtol, atol=atol, options=ode_options
+                )
 
-            C_residual_all = C_all - C_rom_all
 
-            rom_mse_train = torch.mean((C_rom_all[train_ids] - C_all[train_ids])**2).item()
-            rom_mse_val = torch.mean((C_rom_all[val_ids] - C_all[val_ids])**2).item() if len(val_ids) > 0 else None
+        rom_mse_train = torch.mean((C_rom_all[train_ids] - C_all[train_ids]) ** 2).item()
+        rom_mse_val = torch.mean((C_rom_all[val_ids] - C_all[val_ids]) ** 2).item() if len(val_ids) > 0 else None
 
-            print(f"ROM Baseline - Train MSE: {rom_mse_train:.6e}", end="")
-            if rom_mse_val is not None:
-                print(f", Val MSE: {rom_mse_val:.6e}")
-            else:
-                print()
-
-        C_train_target = C_residual_all
+        print(f"ROM Baseline - Train MSE: {rom_mse_train:.6e}", end="")
+        if rom_mse_val is not None:
+            print(f", Val MSE: {rom_mse_val:.6e}")
+        else:
+            print()
     else:
-        C_train_target = C_all
         rom_mse_train, rom_mse_val = None, None
 
-    # Derivative pretraining
+    # Targets
+    if train_on_residuals:
+        R_all = C_all - C_rom_all            # [M, nT, K]
+    else:
+        R_all = None
+
+    # Derivative pretraining (matches dr/dt = NN(t, c_rom))
     if pretrain_derivative and pretrain_epochs > 0:
-        neural_ode_func = pretrain_rhs_derivative_matching(
-            neural_ode_func,
+        assert C_rom_all is not None
+        # residual trajectories used to build finite-diff targets
+        R_for_pretrain = (C_all - C_rom_all)
+
+        hybrid_model.neural_ode = _pretrain_residual_derivative_matching(
+            func=hybrid_model.neural_ode,
             t=t_shared,
-            C=C_train_target,
+            C_rom=C_rom_all,
+            R=R_for_pretrain,
             train_ids=train_ids,
             epochs=pretrain_epochs,
             lr=pretrain_lr,
             batch_ics=min(256, max(16, batch_ics)),
             time_batch=min(128, t_shared.numel()),
         )
-        # keep hybrid_model in sync in case it holds references/params
-        hybrid_model.neural_ode_func = neural_ode_func
 
-    # Optimizer
-    opt = torch.optim.Adam(neural_ode_func.parameters(), lr=lr, weight_decay=weight_decay)
+    # Optimizer (NN only)
+    opt = torch.optim.Adam(hybrid_model.neural_ode.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # LR scheduler
+    # Scheduler
     if lr_schedule == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr_min)
     elif lr_schedule == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=50)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=50)
     else:
         scheduler = None
 
-    train_curve = []
-    val_curve = []
-    val_epochs = []
-    best_val_loss = float('inf')
-    best_epoch = 0
-    patience_counter = 0
-    best_state = None
+    train_curve, val_curve, val_epochs = [], [], []
+    best_val_loss, best_epoch, patience_counter, best_state = float("inf"), 0, 0, None
+
+    def _roll_augmented(c0_batch):
+        """
+        c0_batch: [B, K]
+        returns Y: [B, nT, 2K]
+        """
+        y0 = torch.cat([c0_batch, torch.zeros_like(c0_batch)], dim=-1)  # [B, 2K]
+        Y = odeint_fwd(
+            hybrid_model.forward, y0, t_shared,
+            method=method, rtol=rtol, atol=atol, options=ode_options
+        ).permute(1, 0, 2)  # [B, nT, 2K]
+        return Y
 
     for ep in tqdm(range(1, epochs + 1), desc="Training Hybrid"):
-        neural_ode_func.train()
+        hybrid_model.neural_ode.train()
 
         perm = torch.randperm(len(train_ids), device=device)
         train_ids_shuf = [train_ids[int(i)] for i in perm.tolist()]
 
-        tot_loss = 0.0
-        n_samples = 0
+        tot_loss, n_samples = 0.0, 0
 
         for s in range(0, len(train_ids_shuf), batch_ics):
             b_ids = train_ids_shuf[s : s + batch_ics]
-
-            c_target = C_train_target[b_ids]
-            c0 = torch.zeros_like(c_target[:, 0, :]) if train_on_residuals else c_target[:, 0, :]
+            B = len(b_ids)
 
             opt.zero_grad(set_to_none=True)
 
-            c_pred = odeint_fwd(
-                neural_ode_func.forward, c0, t_shared,
-                method=method, rtol=rtol, atol=atol, options=ode_options
-            ).permute(1, 0, 2)
+            c0 = C_all[b_ids, 0, :]                  # [B, K]
+            Y = _roll_augmented(c0)                  # [B, nT, 2K]
+            c_rom = Y[..., :K]
+            r_pred = Y[..., K:]
+            c_pred = c_rom + r_pred
 
-            loss = torch.mean((c_pred - c_target) ** 2)
+            if train_on_residuals:
+                r_target = R_all[b_ids]              # [B, nT, K]
+                loss = torch.mean((r_pred - r_target) ** 2)
+            else:
+                c_target = C_all[b_ids]              # [B, nT, K]
+                loss = torch.mean((c_pred - c_target) ** 2)
+
             loss.backward()
 
             if grad_clip is not None:
-                nn.utils.clip_grad_norm_(neural_ode_func.parameters(), grad_clip)
+                nn.utils.clip_grad_norm_(hybrid_model.neural_ode.parameters(), grad_clip)
 
             opt.step()
 
-            tot_loss += float(loss.detach().item()) * len(b_ids)
-            n_samples += len(b_ids)
+            tot_loss += float(loss.detach().item()) * B
+            n_samples += B
 
         train_loss = tot_loss / max(1, n_samples)
         train_curve.append(train_loss)
@@ -505,43 +650,53 @@ def train_hybrid_rom_neural_ode(
         if scheduler is not None and lr_schedule != "plateau":
             scheduler.step()
 
+        # Validation
         if len(val_ids) > 0 and (ep % print_every == 0 or ep == epochs):
-            neural_ode_func.eval()
+            hybrid_model.neural_ode.eval()
+
             with torch.no_grad():
-                val_loss_sum = 0.0
-                val_n = 0
+                val_sum, val_n = 0.0, 0
+                chunk = min(64, batch_ics)
 
-                for s in range(0, len(val_ids), min(64, batch_ics)):
-                    b_ids = val_ids[s : s + min(64, batch_ics)]
+                for s in range(0, len(val_ids), chunk):
+                    b_ids = val_ids[s : s + chunk]
+                    B = len(b_ids)
 
-                    c_target = C_train_target[b_ids]
-                    c0 = torch.zeros_like(c_target[:, 0, :]) if train_on_residuals else c_target[:, 0, :]
+                    c0 = C_all[b_ids, 0, :]
+                    Y = _roll_augmented(c0)
+                    c_rom = Y[..., :K]
+                    r_pred = Y[..., K:]
+                    c_pred = c_rom + r_pred
 
-                    c_pred = odeint_fwd(
-                        neural_ode_func.forward, c0, t_shared,
-                        method=method, rtol=rtol, atol=atol, options=ode_options
-                    ).permute(1, 0, 2)
+                    if train_on_residuals:
+                        r_target = R_all[b_ids]
+                        vloss = torch.mean((r_pred - r_target) ** 2)
+                    else:
+                        c_target = C_all[b_ids]
+                        vloss = torch.mean((c_pred - c_target) ** 2)
 
-                    loss = torch.mean((c_pred - c_target) ** 2)
-                    val_loss_sum += float(loss.item()) * len(b_ids)
-                    val_n += len(b_ids)
+                    val_sum += float(vloss.item()) * B
+                    val_n += B
 
-                val_loss = val_loss_sum / max(1, val_n)
+                val_loss = val_sum / max(1, val_n)
                 val_curve.append(val_loss)
                 val_epochs.append(ep)
 
             if scheduler is not None and lr_schedule == "plateau":
                 scheduler.step(val_loss)
 
-            current_lr = opt.param_groups[0]['lr']
+            current_lr = opt.param_groups[0]["lr"]
 
-            if train_on_residuals:
+            if train_on_residuals and rom_mse_val is not None:
+                # This "hybrid_val" display is only meaningful if residual target used the same ROM baseline.
                 hybrid_train = train_loss + rom_mse_train
                 hybrid_val = val_loss + rom_mse_val
                 improvement = (rom_mse_val - hybrid_val) / rom_mse_val * 100
-                print(f"Epoch {ep:4d} | Residual - Train: {train_loss:.6e}, Val: {val_loss:.6e} | "
-                      f"Hybrid - Train: {hybrid_train:.6e}, Val: {hybrid_val:.6e} | "
-                      f"Improvement: {improvement:+.2f}% | LR: {current_lr:.6e}")
+                print(
+                    f"Epoch {ep:4d} | Residual - Train: {train_loss:.6e}, Val: {val_loss:.6e} | "
+                    f"Hybrid - Train: {hybrid_train:.6e}, Val: {hybrid_val:.6e} | "
+                    f"Improvement: {improvement:+.2f}% | LR: {current_lr:.6e}"
+                )
             else:
                 print(f"Epoch {ep:4d} | Train: {train_loss:.6e}, Val: {val_loss:.6e} | LR: {current_lr:.6e}")
 
@@ -549,8 +704,8 @@ def train_hybrid_rom_neural_ode(
                 best_val_loss = val_loss
                 best_epoch = ep
                 patience_counter = 0
-                best_state = {k: v.cpu().clone() for k, v in neural_ode_func.state_dict().items()}
-                print(f"  ✓ New best model!")
+                best_state = {k: v.cpu().clone() for k, v in hybrid_model.neural_ode.state_dict().items()}
+                print("  ✓ New best model!")
             else:
                 patience_counter += print_every
 
@@ -558,14 +713,15 @@ def train_hybrid_rom_neural_ode(
                 print(f"\nEarly stopping at epoch {ep}")
                 break
 
+    # Restore best NN
     if best_state is not None:
-        neural_ode_func.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+        hybrid_model.neural_ode.load_state_dict({k: v.to(device) for k, v in best_state.items()})
         print(f"\n✓ Restored best model from epoch {best_epoch}")
 
     _plot_training_curves(
         train_curve, val_curve, val_epochs, best_epoch,
         title="Hybrid ROM + Neural ODE Training",
-        rom_baseline=rom_mse_train if train_on_residuals else None
+        rom_baseline=rom_mse_train if (train_on_residuals and rom_mse_train is not None) else None
     )
 
     info = {
@@ -583,8 +739,9 @@ def train_hybrid_rom_neural_ode(
         "pretrain_epochs": pretrain_epochs,
         "pretrain_lr": pretrain_lr,
     }
-
     return hybrid_model, info
+
+
 
 
 
@@ -667,68 +824,73 @@ def predict(
 @torch.no_grad()
 def predict_hybrid(
     hybrid_model, dataset, ic_idx=0, t_eval=None,
-    method="dopri5", rtol=1e-6, atol=1e-6,
+    method="dopri5", rtol=1e-6, atol=1e-6, ode_options=None,
     compare_ground_truth=True, plot=True, transform=None,
 ):
     """Predict with hybrid model, showing ROM, residual, and hybrid components."""
     hybrid_model.eval()
     device = dataset.c.device
-    
+
     if t_eval is None:
         t_true, c_true = dataset.get_trajectory(ic_idx)
         t_eval = t_true.clone()
     else:
         t_eval = t_eval.to(device)
         _, c_true = dataset.get_trajectory(ic_idx)
-    
+
     t_eval, order = torch.sort(t_eval)
     c_true = c_true[order]
     c0 = c_true[0]
-    
-    if transform is not None:
-        c0_train = transform.encode(c0)
-    else:
-        c0_train = c0
-    
-    # Get predictions with components
-    c_rom, c_residual, c_hybrid = hybrid_model.predict(
-        c0_train, t_eval, method=method, rtol=rtol, atol=atol, return_components=True
+
+    # training-space IC
+    c0_train = transform.encode(c0) if transform is not None else c0
+
+    # hybrid prediction (training space)
+    c_rom_tr, r_tr, c_pred_tr = hybrid_model.predict(
+        c0_train, t_eval,
+        method=method, rtol=rtol, atol=atol, options=ode_options,
+        return_components=True,
     )
-    
+
+    # decode back to dataset coefficient space
     if transform is not None:
-        c_rom = transform.decode(c_rom)
-        c_hybrid = transform.decode(c_hybrid)
-    
+        c_rom = transform.decode(c_rom_tr)
+        r = transform.decode(r_tr)
+        c_pred = transform.decode(c_pred_tr)
+    else:
+        c_rom, r, c_pred = c_rom_tr, r_tr, c_pred_tr
+
+    # physical space (for plotting)
     c_rom_phys = dataset.denormalize_c(c_rom)
-    c_hybrid_phys = dataset.denormalize_c(c_hybrid)
+    c_pred_phys = dataset.denormalize_c(c_pred)
     c_true_phys = dataset.denormalize_c(c_true)
     t_phys = dataset.denormalize_t(t_eval)
-    
+
     results = {
         "t": t_eval.detach().cpu(),
         "t_phys": t_phys.detach().cpu(),
         "c_rom": c_rom_phys.detach().cpu(),
-        "c_hybrid": c_hybrid_phys.detach().cpu(),
+        "c_residual": dataset.denormalize_c(r).detach().cpu(),
+        "c_hybrid": c_pred_phys.detach().cpu(),
     }
-    
+
     if compare_ground_truth:
-        results["c_true"] = c_true_phys.detach().cpu()
-        
         mse_rom = torch.mean((c_rom - c_true) ** 2).item()
-        mse_hybrid = torch.mean((c_hybrid - c_true) ** 2).item()
-        improvement = (mse_rom - mse_hybrid) / mse_rom * 100
-        
+        mse_hybrid = torch.mean((c_pred - c_true) ** 2).item()
+        improvement = (mse_rom - mse_hybrid) / mse_rom * 100 if mse_rom > 0 else float("nan")
+
+        results["c_true"] = c_true_phys.detach().cpu()
         results["mse_rom"] = mse_rom
         results["mse_hybrid"] = mse_hybrid
         results["improvement_pct"] = improvement
-        
+
         print(f"\nROM MSE:     {mse_rom:.6e}")
         print(f"Hybrid MSE:  {mse_hybrid:.6e}")
         print(f"Improvement: {improvement:+.2f}%")
-    
+
     if plot:
         _plot_hybrid_predictions(results, compare_ground_truth)
-    
+
     return results
 
 
@@ -740,13 +902,11 @@ def predict_and_plot_vs_reference_surface(
 ):
     """
     Predict and compare with reference solution.
-    Works for both Neural ODE and Hybrid models!
-    
-    Args:
-        is_hybrid: If True, func is HybridROMNeuralODE, show components
+
+    If is_hybrid=True, func must be HybridROMNeuralODE and we show ROM + hybrid.
     """
     from plot_utils import plot_sim_result
-    
+
     device = ds.c.device
 
     t_phys = torch.tensor(t_vals, device=device, dtype=ds.t.dtype)
@@ -755,24 +915,28 @@ def predict_and_plot_vs_reference_surface(
 
     c0_stored = project_u0_to_c0_stored(ds, u0_callable)
 
-    if transform is not None:
-        c0_train = transform.encode(c0_stored)
-    else:
-        c0_train = c0_stored
-    
-    # Handle both Neural ODE and Hybrid models
+    c0_train = transform.encode(c0_stored) if transform is not None else c0_stored
+
     if is_hybrid:
-        c_rom, c_residual, c_pred_stored = func.predict(
-            c0_train, t_stored, method=method, rtol=rtol, atol=atol, return_components=True
+        c_rom_tr, c_residual_tr, c_pred_tr = func.predict(
+            c0_train, t_stored,
+            method=method, rtol=rtol, atol=atol, options=ode_options,
+            return_components=True,
         )
+
         if transform is not None:
-            c_rom = transform.decode(c_rom)
-            c_pred_stored = transform.decode(c_pred_stored)
+            c_rom = transform.decode(c_rom_tr)
+            c_pred_stored = transform.decode(c_pred_tr)
+        else:
+            c_rom = c_rom_tr
+            c_pred_stored = c_pred_tr
+
     else:
         c_pred_stored = rollout(func, t_stored, c0_train, method, rtol, atol, ode_options)
         if transform is not None:
             c_pred_stored = transform.decode(c_pred_stored)
 
+    # Reconstruct in physical space
     U_pred_tx = ds.reconstruct_u(c_pred_stored, denormalize=True)
     U_pred_tx_np = U_pred_tx.detach().cpu().numpy()
 
@@ -781,11 +945,11 @@ def predict_and_plot_vs_reference_surface(
 
     X_ref = np.asarray(X_ref, dtype=float)
 
-    plot_sim_result(z_vals, t_vals, U_pred_tz, "u_pred (Neural ODE)", notebook_plot=notebook_plot)
+    title_pred = "u_pred (Hybrid)" if is_hybrid else "u_pred (Neural ODE)"
+    plot_sim_result(z_vals, t_vals, U_pred_tz, title_pred, notebook_plot=notebook_plot)
     plot_sim_result(z_vals, t_vals, X_ref, "u_ref", notebook_plot=notebook_plot)
     plot_sim_result(z_vals, t_vals, np.abs(X_ref - U_pred_tz), "abs error", notebook_plot=notebook_plot)
-    
-    # If hybrid, also show ROM
+
     if is_hybrid:
         U_rom_tx = ds.reconstruct_u(c_rom, denormalize=True)
         U_rom_tz = _u_to_numpy_on_zgrid(U_rom_tx.detach().cpu().numpy(), x_grid, np.asarray(z_vals, float))
@@ -798,7 +962,9 @@ def predict_and_plot_vs_reference_surface(
         "U_ref": X_ref,
         "abs_err": np.abs(X_ref - U_pred_tz),
         "c_pred_stored": c_pred_stored,
+        **({"c_rom_stored": c_rom} if is_hybrid else {}),
     }
+
 
 
 # =====================================================================

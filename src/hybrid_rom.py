@@ -215,93 +215,94 @@ class BurgersGalerkinROM(nn.Module):
 # Hybrid Model
 # =====================================================================
 
+import torch
+import torch.nn as nn
+from torchdiffeq import odeint as odeint_fwd
+
 class HybridROMNeuralODE(nn.Module):
     """
-    Hybrid model: ROM + Neural ODE for residual learning.
-    
-    Training:
-    - ROM provides baseline: c_rom = ROM(c0, t)
-    - Neural ODE learns residual: c_residual = c_true - c_rom
-    - Final prediction: c_hybrid = c_rom + c_residual
+    Option B (correct residual-state hybrid):
+
+    State is y = [c_rom, r] with shape (..., 2K)
+
+      dc_rom/dt = ROM(t, c_rom)
+      dr/dt     = NN(t, c_rom)              (variant B1, simplest)
+      c_hybrid  = c_rom + r
     """
-    
-    def __init__(self, neural_ode_func, rom_dynamics, learn_rom=False):
-        """
-        Args:
-            neural_ode_func: CoeffODEFunc for learning residuals
-            rom_dynamics: BurgersGalerkinROM with known dynamics
-            learn_rom: If True, allow ROM parameters to be trained
-        """
+
+    def __init__(self, neural_ode_func, rom_dynamics, learn_rom: bool = False):
         super().__init__()
-        
         self.neural_ode = neural_ode_func
         self.rom = rom_dynamics
-        
-        # Freeze ROM parameters by default
+
         if not learn_rom:
-            for param in self.rom.parameters():
-                param.requires_grad = False
-    
-    def forward(self, t, c):
-        """Combined dynamics: d(c_rom + c_residual)/dt"""
-        dc_rom = self.rom(t, c)
-        dc_residual = self.neural_ode(t, c)
-        return dc_rom + dc_residual
-    
+            for p in self.rom.parameters():
+                p.requires_grad = False
+
+    def forward(self, t, y):
+        """
+        y: [B, 2K] or [2K]
+        returns dy/dt with same shape
+        """
+        squeeze_back = False
+        if y.ndim == 1:
+            y = y.unsqueeze(0)
+            squeeze_back = True
+
+        K = y.shape[-1] // 2
+        assert 2 * K == y.shape[-1], "y must have last dim 2K"
+
+        c_rom = y[:, :K]
+        r     = y[:, K:]
+
+        dc_rom = self.rom(t, c_rom)
+
+        # Residual dynamics conditioned on ROM state (keeps NN input dim = K)
+        dr = self.neural_ode(t, c_rom)
+
+        dy = torch.cat([dc_rom, dr], dim=-1)
+        return dy.squeeze(0) if squeeze_back else dy
+
     @torch.no_grad()
-    def get_rom_prediction(self, c0, t, method='dopri5', rtol=1e-6, atol=1e-6):
-        """Get ROM-only prediction."""
-        return self.rom.integrate(c0, t, method=method, rtol=rtol, atol=atol)
-    
-    def get_residual(self, c0, t, c_true, method='dopri5', rtol=1e-6, atol=1e-6):
+    def predict(self, c0, t, method="dopri5", rtol=1e-6, atol=1e-6, options=None, return_components=False):
         """
-        Compute residual: c_true - ROM(c0, t)
-        
         Returns:
-            residual: [nT, B, K] - what Neural ODE should learn
-            c_rom: [nT, B, K] - ROM prediction
+          c_pred: [nT, B, K] (or [nT, K] if c0 was [K])
+
+        If return_components=True:
+          (c_rom, r, c_pred)
         """
-        c_rom = self.get_rom_prediction(c0, t, method=method, rtol=rtol, atol=atol)
-        residual = c_true - c_rom
-        return residual, c_rom
-    
-    @torch.no_grad()
-    def predict(self, c0, t, method='dopri5', rtol=1e-6, atol=1e-6, return_components=False):
-        """
-        Hybrid prediction: ROM + Neural ODE correction
-        
-        Args:
-            c0: Initial condition [B, K] or [K]
-            t: Time points [nT]
-            return_components: If True, return (c_rom, c_residual, c_hybrid)
-        
-        Returns:
-            c_pred: Hybrid prediction
-            OR (c_rom, c_residual, c_pred) if return_components=True
-        """
-        # ROM prediction
-        c_rom = self.get_rom_prediction(c0, t, method=method, rtol=rtol, atol=atol)
-        
-        # Neural ODE starts from zero residual
+        squeeze_B = False
         if c0.ndim == 1:
-            residual_c0 = torch.zeros_like(c0)
+            c0B = c0.unsqueeze(0)
+            squeeze_B = True
         else:
-            residual_c0 = torch.zeros_like(c0)
-        
-        # Integrate Neural ODE for residual
-        c_residual = odeint_fwd(
-            self.neural_ode.forward,
-            residual_c0,
-            t,
-            method=method,
-            rtol=rtol,
-            atol=atol
-        )
-        
-        # Combine
-        c_pred = c_rom + c_residual
-        
+            c0B = c0
+
+        r0 = torch.zeros_like(c0B)
+        y0 = torch.cat([c0B, r0], dim=-1)          # [B, 2K]
+
+        Y = odeint_fwd(self.forward, y0, t, method=method, rtol=rtol, atol=atol, options=options)
+        # Y: [nT, B, 2K]
+
+        K = c0B.shape[-1]
+        c_rom = Y[..., :K]
+        r     = Y[..., K:]
+        c_pred = c_rom + r
+
+        if squeeze_B:
+            c_rom = c_rom[:, 0, :]
+            r     = r[:, 0, :]
+            c_pred = c_pred[:, 0, :]
+
         if return_components:
-            return c_rom, c_residual, c_pred
-        
+            return c_rom, r, c_pred
         return c_pred
+
+    @torch.no_grad()
+    def get_rom_prediction(self, c0, t, method="dopri5", rtol=1e-6, atol=1e-6, options=None):
+        """
+        Pure ROM rollout (for diagnostics/baseline).
+        """
+        return self.rom.integrate(c0, t, method=method, rtol=rtol, atol=atol)
+

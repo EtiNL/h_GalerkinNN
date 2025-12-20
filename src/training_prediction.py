@@ -382,31 +382,31 @@ def train_hybrid_rom_neural_ode(
     lr_schedule: str = "cosine",
     lr_min: float = 1e-6,
     train_on_residuals: bool = True,
+    # >>> added
+    pretrain_derivative: bool = True,
+    pretrain_epochs: int = 10,
+    pretrain_lr: float = 1e-3,
 ):
     """
     Train Hybrid ROM + Neural ODE.
-    
-    Returns:
-        hybrid_model: Trained hybrid model
-        info: Training information dictionary
     """
     from hybrid_rom import HybridROMNeuralODE
-    
+
     device = C_all.device
-    
+
     # Create hybrid model
     hybrid_model = HybridROMNeuralODE(
         neural_ode_func=neural_ode_func,
         rom_dynamics=rom_dynamics,
         learn_rom=False
     ).to(device)
-    
+
     print(f"\n{'='*70}")
     print("HYBRID ROM + NEURAL ODE TRAINING")
     print(f"{'='*70}")
     print(f"Neural ODE parameters: {sum(p.numel() for p in neural_ode_func.parameters()):,}")
     print(f"Train ICs: {len(train_ids)}, Val ICs: {len(val_ids)}")
-    
+
     # Compute ROM predictions
     if train_on_residuals:
         print("\nComputing ROM predictions...")
@@ -415,26 +415,41 @@ def train_hybrid_rom_neural_ode(
             for i in tqdm(range(C_all.shape[0]), desc="ROM baseline"):
                 c0 = C_all[i, 0, :]
                 C_rom_all[i] = hybrid_model.get_rom_prediction(c0, t_shared, method=method, rtol=rtol, atol=atol)
-            
+
             C_residual_all = C_all - C_rom_all
-            
+
             rom_mse_train = torch.mean((C_rom_all[train_ids] - C_all[train_ids])**2).item()
             rom_mse_val = torch.mean((C_rom_all[val_ids] - C_all[val_ids])**2).item() if len(val_ids) > 0 else None
-            
+
             print(f"ROM Baseline - Train MSE: {rom_mse_train:.6e}", end="")
             if rom_mse_val is not None:
                 print(f", Val MSE: {rom_mse_val:.6e}")
             else:
                 print()
-        
+
         C_train_target = C_residual_all
     else:
         C_train_target = C_all
         rom_mse_train, rom_mse_val = None, None
-    
+
+    # Derivative pretraining
+    if pretrain_derivative and pretrain_epochs > 0:
+        neural_ode_func = pretrain_rhs_derivative_matching(
+            neural_ode_func,
+            t=t_shared,
+            C=C_train_target,
+            train_ids=train_ids,
+            epochs=pretrain_epochs,
+            lr=pretrain_lr,
+            batch_ics=min(256, max(16, batch_ics)),
+            time_batch=min(128, t_shared.numel()),
+        )
+        # keep hybrid_model in sync in case it holds references/params
+        hybrid_model.neural_ode_func = neural_ode_func
+
     # Optimizer
     opt = torch.optim.Adam(neural_ode_func.parameters(), lr=lr, weight_decay=weight_decay)
-    
+
     # LR scheduler
     if lr_schedule == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr_min)
@@ -442,8 +457,7 @@ def train_hybrid_rom_neural_ode(
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=50)
     else:
         scheduler = None
-    
-    # Training loop
+
     train_curve = []
     val_curve = []
     val_epochs = []
@@ -451,78 +465,76 @@ def train_hybrid_rom_neural_ode(
     best_epoch = 0
     patience_counter = 0
     best_state = None
-    
+
     for ep in tqdm(range(1, epochs + 1), desc="Training Hybrid"):
         neural_ode_func.train()
-        
+
         perm = torch.randperm(len(train_ids), device=device)
         train_ids_shuf = [train_ids[int(i)] for i in perm.tolist()]
-        
+
         tot_loss = 0.0
         n_samples = 0
-        
+
         for s in range(0, len(train_ids_shuf), batch_ics):
             b_ids = train_ids_shuf[s : s + batch_ics]
-            
+
             c_target = C_train_target[b_ids]
             c0 = torch.zeros_like(c_target[:, 0, :]) if train_on_residuals else c_target[:, 0, :]
-            
+
             opt.zero_grad(set_to_none=True)
-            
+
             c_pred = odeint_fwd(
                 neural_ode_func.forward, c0, t_shared,
                 method=method, rtol=rtol, atol=atol, options=ode_options
             ).permute(1, 0, 2)
-            
+
             loss = torch.mean((c_pred - c_target) ** 2)
             loss.backward()
-            
+
             if grad_clip is not None:
                 nn.utils.clip_grad_norm_(neural_ode_func.parameters(), grad_clip)
-            
+
             opt.step()
-            
+
             tot_loss += float(loss.detach().item()) * len(b_ids)
             n_samples += len(b_ids)
-        
+
         train_loss = tot_loss / max(1, n_samples)
         train_curve.append(train_loss)
-        
+
         if scheduler is not None and lr_schedule != "plateau":
             scheduler.step()
-        
-        # Validation
+
         if len(val_ids) > 0 and (ep % print_every == 0 or ep == epochs):
             neural_ode_func.eval()
-            
             with torch.no_grad():
                 val_loss_sum = 0.0
                 val_n = 0
-                
+
                 for s in range(0, len(val_ids), min(64, batch_ics)):
                     b_ids = val_ids[s : s + min(64, batch_ics)]
-                    
+
                     c_target = C_train_target[b_ids]
                     c0 = torch.zeros_like(c_target[:, 0, :]) if train_on_residuals else c_target[:, 0, :]
-                    
+
                     c_pred = odeint_fwd(
                         neural_ode_func.forward, c0, t_shared,
                         method=method, rtol=rtol, atol=atol, options=ode_options
                     ).permute(1, 0, 2)
-                    
+
                     loss = torch.mean((c_pred - c_target) ** 2)
                     val_loss_sum += float(loss.item()) * len(b_ids)
                     val_n += len(b_ids)
-                
+
                 val_loss = val_loss_sum / max(1, val_n)
                 val_curve.append(val_loss)
                 val_epochs.append(ep)
-            
+
             if scheduler is not None and lr_schedule == "plateau":
                 scheduler.step(val_loss)
-            
+
             current_lr = opt.param_groups[0]['lr']
-            
+
             if train_on_residuals:
                 hybrid_train = train_loss + rom_mse_train
                 hybrid_val = val_loss + rom_mse_val
@@ -532,7 +544,7 @@ def train_hybrid_rom_neural_ode(
                       f"Improvement: {improvement:+.2f}% | LR: {current_lr:.6e}")
             else:
                 print(f"Epoch {ep:4d} | Train: {train_loss:.6e}, Val: {val_loss:.6e} | LR: {current_lr:.6e}")
-            
+
             if val_loss < best_val_loss - early_stopping_min_delta:
                 best_val_loss = val_loss
                 best_epoch = ep
@@ -541,21 +553,21 @@ def train_hybrid_rom_neural_ode(
                 print(f"  ✓ New best model!")
             else:
                 patience_counter += print_every
-            
+
             if patience_counter >= early_stopping_patience:
                 print(f"\nEarly stopping at epoch {ep}")
                 break
-    
-    # Restore best
+
     if best_state is not None:
         neural_ode_func.load_state_dict({k: v.to(device) for k, v in best_state.items()})
         print(f"\n✓ Restored best model from epoch {best_epoch}")
-    
-    # Plot
-    _plot_training_curves(train_curve, val_curve, val_epochs, best_epoch, 
-                         title="Hybrid ROM + Neural ODE Training",
-                         rom_baseline=rom_mse_train if train_on_residuals else None)
-    
+
+    _plot_training_curves(
+        train_curve, val_curve, val_epochs, best_epoch,
+        title="Hybrid ROM + Neural ODE Training",
+        rom_baseline=rom_mse_train if train_on_residuals else None
+    )
+
     info = {
         "train_ids": train_ids,
         "val_ids": val_ids,
@@ -567,9 +579,13 @@ def train_hybrid_rom_neural_ode(
         "rom_mse_train": rom_mse_train,
         "rom_mse_val": rom_mse_val,
         "train_on_residuals": train_on_residuals,
+        "pretrain_derivative": pretrain_derivative,
+        "pretrain_epochs": pretrain_epochs,
+        "pretrain_lr": pretrain_lr,
     }
-    
+
     return hybrid_model, info
+
 
 
 # =====================================================================

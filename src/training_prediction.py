@@ -541,13 +541,17 @@ def train_hybrid_rom_neural_ode(
     if need_rom:
         print("\nComputing ROM predictions...")
         with torch.no_grad():
-            C_rom_all = torch.zeros_like(C_all)
-            for i in tqdm(range(M), desc="ROM baseline"):
-                c0 = C_all[i, 0, :]
-                # ROM.integrate returns [nT, K] (for 1D c0). Ensure it matches C_all[i] layout.
-                C_rom_all[i] = hybrid_model.get_rom_prediction(
-                    c0, t_shared, method=method, rtol=rtol, atol=atol, options=ode_options
-                )
+            C_rom_all = torch.empty_like(C_all)
+
+            chunk = 256  # tune
+            for s in tqdm(range(0, M, chunk), desc="ROM baseline (batched)"):
+                e = min(s + chunk, M)
+                c0 = C_all[s:e, 0, :]                      # [B, K]
+                C_rom_tBK = hybrid_model.get_rom_prediction(
+                    c0, t_shared,
+                    method=method, rtol=rtol, atol=atol, options=ode_options
+                )                                           # [nT, B, K]
+                C_rom_all[s:e] = C_rom_tBK.permute(1, 0, 2)
 
 
         rom_mse_train = torch.mean((C_rom_all[train_ids] - C_all[train_ids]) ** 2).item()

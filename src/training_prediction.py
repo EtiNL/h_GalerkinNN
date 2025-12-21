@@ -936,11 +936,7 @@ def predict(
 
     # --- plotting ---
     if plot:
-        if is_hybrid:
-            _plot_hybrid_predictions(results, compare_ground_truth)
-        else:
-            _plot_predictions(results, reconstruct, compare_ground_truth)
-
+        _plot_predictions(results, reconstruct, compare_ground_truth)
     return results
 
 
@@ -1092,57 +1088,65 @@ def _plot_training_curves(train_curve, val_curve, val_epochs, best_epoch, title=
 
 
 def _plot_predictions(results, reconstruct, compare_ground_truth):
-    """Plot prediction results."""
+    """
+    Unified plotter:
+      - Non-hybrid: plots predicted vs true (same as before).
+      - Hybrid: additionally plots ROM baseline with same visual style.
+    Expects:
+      results["t_phys"], results["c_pred_phys"]
+      optionally results["c_true_phys"]
+      optionally results["c_rom"] (hybrid)
+    """
     t_phys = results["t_phys"].numpy()
+
     c_pred = results["c_pred_phys"].numpy()
     K = c_pred.shape[1]
     n_plot = min(5, K)
 
-    fig1 = go.Figure()
-    for k in range(n_plot):
-        fig1.add_trace(go.Scatter(x=t_phys, y=c_pred[:, k], mode="lines", name=f"c_{k} (pred)"))
-        if compare_ground_truth:
-            c_true = results["c_true_phys"].numpy()
-            fig1.add_trace(go.Scatter(x=t_phys, y=c_true[:, k], mode="lines",
-                                     name=f"c_{k} (true)", opacity=0.7))
-    
-    fig1.update_layout(title="Predicted Coefficients", xaxis_title="Time",
-                      yaxis_title="Coefficient value", height=500)
-    fig1.show()
+    has_true = compare_ground_truth and ("c_true_phys" in results)
+    has_rom = "c_rom" in results  # hybrid marker
 
+    if has_true:
+        c_true = results["c_true_phys"].numpy()
+    if has_rom:
+        c_rom = results["c_rom"].numpy()
 
-def _plot_hybrid_predictions(results, compare_ground_truth):
-    """Plot hybrid prediction results with ROM and hybrid components."""
-    t_phys = results["t_phys"].numpy()
-    c_rom = results["c_rom"].numpy()
-    c_hybrid = results["c_hybrid"].numpy()
-    
-    K = c_hybrid.shape[1]
-    n_plot = min(4, K)
-    
-    fig = make_subplots(rows=n_plot, cols=1,
-                       subplot_titles=[f"Mode {k}" for k in range(n_plot)],
-                       vertical_spacing=0.08)
-    
+    fig = go.Figure()
+
     for k in range(n_plot):
-        row = k + 1
-        
-        fig.add_trace(go.Scatter(x=t_phys, y=c_rom[:, k], mode="lines", name="ROM",
-                                line=dict(color="red", dash="dash", width=2),
-                                legendgroup="rom", showlegend=(k==0)), row=row, col=1)
-        
-        fig.add_trace(go.Scatter(x=t_phys, y=c_hybrid[:, k], mode="lines", name="Hybrid",
-                                line=dict(color="blue", width=2),
-                                legendgroup="hybrid", showlegend=(k==0)), row=row, col=1)
-        
-        if compare_ground_truth:
-            c_true = results["c_true"].numpy()
-            fig.add_trace(go.Scatter(x=t_phys, y=c_true[:, k], mode="lines", name="True",
-                                    line=dict(color="black", width=2),
-                                    legendgroup="true", showlegend=(k==0)), row=row, col=1)
-        
-        fig.update_xaxes(title_text="Time" if k == n_plot-1 else "", row=row, col=1)
-        fig.update_yaxes(title_text=f"c_{k}", row=row, col=1)
-    
-    fig.update_layout(title="Hybrid ROM + Neural ODE", height=300*n_plot, showlegend=True)
+        # Hybrid / predicted (same style you already like)
+        fig.add_trace(go.Scatter(
+            x=t_phys, y=c_pred[:, k],
+            mode="lines",
+            name=f"c_{k} (pred)",
+        ))
+
+        # ROM baseline (hybrid only)
+        if has_rom:
+            fig.add_trace(go.Scatter(
+                x=t_phys, y=c_rom[:, k],
+                mode="lines",
+                name=f"c_{k} (ROM)",
+                opacity=0.8,
+                line=dict(dash="dash"),
+            ))
+
+        # Ground truth
+        if has_true:
+            fig.add_trace(go.Scatter(
+                x=t_phys, y=c_true[:, k],
+                mode="lines",
+                name=f"c_{k} (true)",
+                opacity=0.7,
+            ))
+
+    title = "Predicted Coefficients (Hybrid + ROM)" if has_rom else "Predicted Coefficients"
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time",
+        yaxis_title="Coefficient value",
+        height=500,
+        legend=dict(orientation="h"),
+    )
     fig.show()

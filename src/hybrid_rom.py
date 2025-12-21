@@ -257,8 +257,9 @@ class HybridROMNeuralODE(nn.Module):
 
         dc_rom = self.rom(t, c_rom)
 
-        # Residual dynamics conditioned on ROM state (keeps NN input dim = K)
-        dr = self.neural_ode(t, c_rom)
+        # Residual dynamics conditioned on the full hybrid state
+        c_full = c_rom + r
+        dr = self.neural_ode(t, c_full)
 
         dy = torch.cat([dc_rom, dr], dim=-1)
         return dy.squeeze(0) if squeeze_back else dy

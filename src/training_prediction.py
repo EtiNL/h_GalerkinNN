@@ -492,11 +492,14 @@ def _pretrain_residual_derivative_matching(
         tidx = torch.randint(0, nT, (time_batch,), device=device)
         t_s = t[tidx]
 
-        c_rom_s = C_rom[ic_ids][:, tidx, :].reshape(-1, C_rom.shape[2])
-        dR_s    = dR[ic_ids][:, tidx, :].reshape(-1, dR.shape[2])
+        c_rom_s = C_rom[ic_ids][:, tidx, :].reshape(-1, C_rom.shape[2])   # [B*time_batch, K]
+        r_s     = R[ic_ids][:, tidx, :].reshape(-1, R.shape[2])           # [B*time_batch, K]
+        dR_s    = dR[ic_ids][:, tidx, :].reshape(-1, dR.shape[2])         # [B*time_batch, K]
+
+        c_full_s = c_rom_s + r_s
 
         tt = t_s.to(dtype=c_rom_s.dtype).repeat(len(ic_ids), 1).reshape(-1)
-        pred = func(tt, c_rom_s)  # dr/dt
+        pred = func(tt, c_full_s)  # dr/dt conditioned on (c_rom + r)
         loss = torch.mean((pred - dR_s) ** 2)
 
         loss.backward()

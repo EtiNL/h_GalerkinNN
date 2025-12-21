@@ -192,6 +192,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
     epochs: int = 2000,
     weight_decay: float = 1e-5,
     hidden: int = 256,
+    num_layers: int = 1,
     time_dependent: bool = True,
     method: str = "dopri5",
     rtol: float = 1e-6,
@@ -238,7 +239,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
 
     train_ids, val_ids = _split_indices(M, val_frac=val_frac, seed=split_seed)
 
-    func = CoeffODEFunc(K, hidden=hidden, time_dependent=time_dependent).to(device)
+    func = CoeffODEFunc(K, hidden=hidden, time_dependent=time_dependent, num_layers=num_layers).to(device)
     
     print(f"\n{'='*60}")
     print("NEURAL ODE TRAINING")

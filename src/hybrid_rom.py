@@ -187,7 +187,7 @@ class BurgersGalerkinROM(nn.Module):
         return dc_dt
     
     @torch.no_grad()
-    def integrate(self, c0, t, method='dopri5', rtol=1e-6, atol=1e-6):
+    def integrate(self, c0, t, method='dopri5', rtol=1e-6, atol=1e-6, options=None):
         """
         Integrate ROM from initial condition.
         
@@ -203,7 +203,7 @@ class BurgersGalerkinROM(nn.Module):
             c0 = c0.unsqueeze(0)
             squeeze_output = True
         
-        c_rom = odeint_fwd(self.forward, c0, t, method=method, rtol=rtol, atol=atol)
+        c_rom = odeint_fwd(self.forward, c0, t, method=method, rtol=rtol, atol=atol, options=options)
         
         if squeeze_output:
             c_rom = c_rom.squeeze(1)
@@ -300,9 +300,9 @@ class HybridROMNeuralODE(nn.Module):
         return c_pred
 
     @torch.no_grad()
-    def get_rom_prediction(self, c0, t, method="dopri5", rtol=1e-6, atol=1e-6, options=None):
+    def get_rom_prediction(self, c0, t, method='dopri5', rtol=1e-6, atol=1e-6, options=None):
         """
         Pure ROM rollout (for diagnostics/baseline).
         """
-        return self.rom.integrate(c0, t, method=method, rtol=rtol, atol=atol)
+        return self.rom.integrate(c0, t, method=method, rtol=rtol, atol=atol, options=options)
 

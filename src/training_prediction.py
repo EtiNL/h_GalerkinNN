@@ -371,6 +371,7 @@ def _diagnose_rom_consistency(
     t_shared,
     C_all,
     C_rom_all,
+    rom_consistency_tol,
     method="dopri5",
     rtol=1e-6,
     atol=1e-6,
@@ -422,7 +423,7 @@ def _diagnose_rom_consistency(
     print(f"  per-IC max|diff|: {stats['per_ic_max_abs'].numpy()}")
 
     # Heuristic warning threshold (tune if needed)
-    if stats["max_abs"] > 1e-4:
+    if stats["max_abs"] > rom_consistency_tol:
         print("  ⚠ WARNING: ROM rollouts differ noticeably. "
               "Residual targets may be inconsistent with model ROM.")
     else:
@@ -500,6 +501,9 @@ def train_hybrid_rom_neural_ode(
     pretrain_derivative: bool = True,
     pretrain_epochs: int = 10,
     pretrain_lr: float = 1e-3,
+    assert_rom_consistency: bool = True,
+    rom_consistency_tol: float = 1e-4,
+    rom_consistency_ncheck: int = 8,
 ):
     """
     Matches your HybridROMNeuralODE implementation:
@@ -554,6 +558,31 @@ def train_hybrid_rom_neural_ode(
             print(f", Val MSE: {rom_mse_val:.6e}")
         else:
             print()
+
+        # ROM vs augmented-trajectory consistency assertion (only needed for residual training)
+        if train_on_residuals and assert_rom_consistency:
+            stats = _diagnose_rom_consistency(
+                hybrid_model=hybrid_model,
+                t_shared=t_shared,
+                C_all=C_all,
+                C_rom_all=C_rom_all,
+                rom_consistency_tol = rom_consistency_tol,
+                method=method,
+                rtol=rtol,
+                atol=atol,
+                ode_options=ode_options,
+                n_check=rom_consistency_ncheck,
+            )
+            if stats["max_abs"] > rom_consistency_tol:
+                raise RuntimeError(
+                    f"ROM consistency check failed: max|diff|={stats['max_abs']:.3e} "
+                    f"> tol={rom_consistency_tol:.3e}. "
+                    "Your residual targets C_all - C_rom_all may be inconsistent with the ROM "
+                    "trajectory used inside the augmented integration. "
+                    "Common causes: ode_options mismatch, different solver tolerances/options, "
+                    "or ROM.integrate not using options."
+                )
+
     else:
         rom_mse_train, rom_mse_val = None, None
 
@@ -687,18 +716,24 @@ def train_hybrid_rom_neural_ode(
 
             current_lr = opt.param_groups[0]["lr"]
 
-            if train_on_residuals and rom_mse_val is not None:
-                # This "hybrid_val" display is only meaningful if residual target used the same ROM baseline.
-                hybrid_train = train_loss + rom_mse_train
-                hybrid_val = val_loss + rom_mse_val
+            hybrid_train = train_loss
+            hybrid_val   = val_loss
+
+            if rom_mse_val is not None:
                 improvement = (rom_mse_val - hybrid_val) / rom_mse_val * 100
                 print(
-                    f"Epoch {ep:4d} | Residual - Train: {train_loss:.6e}, Val: {val_loss:.6e} | "
-                    f"Hybrid - Train: {hybrid_train:.6e}, Val: {hybrid_val:.6e} | "
-                    f"Improvement: {improvement:+.2f}% | LR: {current_lr:.6e}"
+                    f"\n Epoch {ep:4d} | "
+                    f"Train: {hybrid_train:.6e}, Val: {hybrid_val:.6e} | "
+                    f"ROM Val: {rom_mse_val:.6e} | "
+                    f"Improvement: {improvement:+.2f}% | "
+                    f"LR: {current_lr:.6e}"
                 )
             else:
-                print(f"Epoch {ep:4d} | Train: {train_loss:.6e}, Val: {val_loss:.6e} | LR: {current_lr:.6e}")
+                print(
+                    f"\n Epoch {ep:4d} | "
+                    f"Train: {hybrid_train:.6e}, Val: {hybrid_val:.6e} | "
+                    f"LR: {current_lr:.6e}"
+                )
 
             if val_loss < best_val_loss - early_stopping_min_delta:
                 best_val_loss = val_loss

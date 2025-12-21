@@ -1026,20 +1026,49 @@ def predict_and_plot_vs_reference_surface(
     }
 
 @torch.no_grad()
-def eval_hybrid_val_mse(hybrid_model, t_shared, C_all, val_ids,
-                        method="dopri5", rtol=1e-6, atol=1e-6, ode_options=None):
+def eval_hybrid_val_mse(
+    hybrid_model,
+    t_shared,
+    C_all,
+    val_ids,
+    method="dopri5",
+    rtol=1e-6,
+    atol=1e-6,
+    ode_options=None,
+    batch_ics: int = 64,
+):
+    """
+    Returns mean MSE over val_ids in coefficient space.
+    Batched over initial conditions to avoid Python loop overhead.
+    """
     device = C_all.device
     hybrid_model.eval()
+
+    M, nT, K = C_all.shape
+    ids = list(val_ids)
+    if len(ids) == 0:
+        return float("nan")
+
     mse_sum = 0.0
     n = 0
-    for i in val_ids:
-        c_true = C_all[i]                 # [nT, K]
-        c0 = c_true[0]
-        c_pred = hybrid_model.predict(c0, t_shared, method=method, rtol=rtol, atol=atol,
-                                      options=ode_options, return_components=False)
-        mse_sum += torch.mean((c_pred - c_true) ** 2).item()
-        n += 1
+
+    for s in range(0, len(ids), batch_ics):
+        b_ids = ids[s : s + batch_ics]
+        c_true = C_all[b_ids]               # [B, nT, K]
+        c0 = c_true[:, 0, :]                # [B, K]
+
+        # HybridROMNeuralODE.predict supports batched c0 -> [nT, B, K]
+        c_pred_tBK = hybrid_model.predict(
+            c0, t_shared, method=method, rtol=rtol, atol=atol, options=ode_options, return_components=False
+        )
+        c_pred = c_pred_tBK.permute(1, 0, 2).contiguous()  # [B, nT, K]
+
+        mse = torch.mean((c_pred - c_true) ** 2)           # scalar mean over B,nT,K
+        mse_sum += float(mse.item()) * len(b_ids)
+        n += len(b_ids)
+
     return mse_sum / max(1, n)
+
 
 
 

@@ -811,18 +811,24 @@ def train_hybrid_rom_neural_ode(
 
 @torch.no_grad()
 def predict(
-    func, dataset, ic_idx=0, t_eval=None,
-    method="dopri5", rtol=1e-6, atol=1e-6, ode_options=None,
-    reconstruct=True, compare_ground_truth=True, plot=True,
+    func,
+    dataset,
+    ic_idx=0,
+    t_eval=None,
+    method="dopri5",
+    rtol=1e-6,
+    atol=1e-6,
+    ode_options=None,
+    reconstruct=True,
+    compare_ground_truth=True,
+    plot=True,
     transform=None,
+    is_hybrid: bool = False,
 ):
-    """
-    Predict with Neural ODE or Hybrid model.
-    Works for both!
-    """
     func.eval()
     device = dataset.c.device
 
+    # --- time + ground truth ---
     if t_eval is None:
         t_true, c_true = dataset.get_trajectory(ic_idx)
         t_eval = t_true.clone()
@@ -834,34 +840,88 @@ def predict(
     c_true = c_true[order]
     c0 = c_true[0]
 
-    if transform is not None:
-        c0_train = transform.encode(c0)
-        c_pred_train = rollout(func, t_eval, c0_train, method, rtol, atol, ode_options)
-        c_pred = transform.decode(c_pred_train)
+    # --- training-space IC ---
+    c0_train = transform.encode(c0) if transform is not None else c0
+
+    # --- rollout ---
+    if is_hybrid:
+        c_rom_tr, r_tr, c_pred_tr = func.predict(
+            c0_train,
+            t_eval,
+            method=method,
+            rtol=rtol,
+            atol=atol,
+            options=ode_options,
+            return_components=True,
+        )
     else:
-        c_pred = rollout(func, t_eval, c0, method, rtol, atol, ode_options)
+        c_pred_tr = rollout(
+            func, t_eval, c0_train,
+            method=method, rtol=rtol, atol=atol, options=ode_options
+        )
 
-    results = {"t": t_eval.detach().cpu(), "c_pred": c_pred.detach().cpu()}
+    # --- decode ---
+    if transform is not None:
+        c_pred = transform.decode(c_pred_tr)
+        if is_hybrid:
+            c_rom = transform.decode(c_rom_tr)
+            r = transform.decode(r_tr)
+    else:
+        c_pred = c_pred_tr
+        if is_hybrid:
+            c_rom, r = c_rom_tr, r_tr
 
+    # --- physical space ---
     c_pred_phys = dataset.denormalize_c(c_pred)
     c_true_phys = dataset.denormalize_c(c_true)
     t_phys = dataset.denormalize_t(t_eval)
 
-    results["c_pred_phys"] = c_pred_phys.detach().cpu()
-    results["t_phys"] = t_phys.detach().cpu()
+    results = {
+        "t": t_eval.detach().cpu(),
+        "t_phys": t_phys.detach().cpu(),
+        "c_pred": c_pred.detach().cpu(),
+        "c_pred_phys": c_pred_phys.detach().cpu(),
+    }
 
+    # --- metrics ---
     if compare_ground_truth:
-        results["c_true"] = c_true.detach().cpu()
-        results["c_true_phys"] = c_true_phys.detach().cpu()
         mse_coeff = torch.mean((c_pred - c_true) ** 2).item()
-        results["mse_coeff"] = mse_coeff
+        results.update({
+            "c_true": c_true.detach().cpu(),
+            "c_true_phys": c_true_phys.detach().cpu(),
+            "mse_coeff": mse_coeff,
+        })
+
         print(f"MSE (coefficient space): {mse_coeff:.6e}")
 
+    # --- hybrid extras ---
+    if is_hybrid:
+        c_rom_phys = dataset.denormalize_c(c_rom)
+        results.update({
+            "c_rom": c_rom_phys.detach().cpu(),
+            "c_residual": dataset.denormalize_c(r).detach().cpu(),
+            "c_hybrid": c_pred_phys.detach().cpu(),
+        })
+
+        if compare_ground_truth:
+            mse_rom = torch.mean((c_rom - c_true) ** 2).item()
+            mse_hybrid = mse_coeff
+            improvement = (mse_rom - mse_hybrid) / mse_rom * 100 if mse_rom > 0 else float("nan")
+
+            results.update({
+                "mse_rom": mse_rom,
+                "mse_hybrid": mse_hybrid,
+                "improvement_pct": improvement,
+            })
+
+            print(f"ROM MSE:     {mse_rom:.6e}")
+            print(f"Hybrid MSE:  {mse_hybrid:.6e}")
+            print(f"Improvement: {improvement:+.2f}%")
+
+    # --- reconstruction ---
     if reconstruct:
         try:
             x_grid = dataset.get_reconstruction_grid()
-            results["x_grid"] = x_grid
-
             u_pred = dataset.reconstruct_u(c_pred, denormalize=True)
             results["u_pred"] = u_pred.detach().cpu()
 
@@ -873,85 +933,16 @@ def predict(
                 print(f"MSE (spatial domain): {mse_spatial:.6e}")
         except Exception as e:
             print(f"Could not reconstruct: {e}")
-            reconstruct = False
 
+    # --- plotting ---
     if plot:
-        _plot_predictions(results, reconstruct, compare_ground_truth)
+        if is_hybrid:
+            _plot_hybrid_predictions(results, compare_ground_truth)
+        else:
+            _plot_predictions(results, reconstruct, compare_ground_truth)
 
     return results
 
-
-@torch.no_grad()
-def predict_hybrid(
-    hybrid_model, dataset, ic_idx=0, t_eval=None,
-    method="dopri5", rtol=1e-6, atol=1e-6, ode_options=None,
-    compare_ground_truth=True, plot=True, transform=None,
-):
-    """Predict with hybrid model, showing ROM, residual, and hybrid components."""
-    hybrid_model.eval()
-    device = dataset.c.device
-
-    if t_eval is None:
-        t_true, c_true = dataset.get_trajectory(ic_idx)
-        t_eval = t_true.clone()
-    else:
-        t_eval = t_eval.to(device)
-        _, c_true = dataset.get_trajectory(ic_idx)
-
-    t_eval, order = torch.sort(t_eval)
-    c_true = c_true[order]
-    c0 = c_true[0]
-
-    # training-space IC
-    c0_train = transform.encode(c0) if transform is not None else c0
-
-    # hybrid prediction (training space)
-    c_rom_tr, r_tr, c_pred_tr = hybrid_model.predict(
-        c0_train, t_eval,
-        method=method, rtol=rtol, atol=atol, options=ode_options,
-        return_components=True,
-    )
-
-    # decode back to dataset coefficient space
-    if transform is not None:
-        c_rom = transform.decode(c_rom_tr)
-        r = transform.decode(r_tr)
-        c_pred = transform.decode(c_pred_tr)
-    else:
-        c_rom, r, c_pred = c_rom_tr, r_tr, c_pred_tr
-
-    # physical space (for plotting)
-    c_rom_phys = dataset.denormalize_c(c_rom)
-    c_pred_phys = dataset.denormalize_c(c_pred)
-    c_true_phys = dataset.denormalize_c(c_true)
-    t_phys = dataset.denormalize_t(t_eval)
-
-    results = {
-        "t": t_eval.detach().cpu(),
-        "t_phys": t_phys.detach().cpu(),
-        "c_rom": c_rom_phys.detach().cpu(),
-        "c_residual": dataset.denormalize_c(r).detach().cpu(),
-        "c_hybrid": c_pred_phys.detach().cpu(),
-    }
-
-    if compare_ground_truth:
-        mse_rom = torch.mean((c_rom - c_true) ** 2).item()
-        mse_hybrid = torch.mean((c_pred - c_true) ** 2).item()
-        improvement = (mse_rom - mse_hybrid) / mse_rom * 100 if mse_rom > 0 else float("nan")
-
-        results["c_true"] = c_true_phys.detach().cpu()
-        results["mse_rom"] = mse_rom
-        results["mse_hybrid"] = mse_hybrid
-        results["improvement_pct"] = improvement
-
-        print(f"\nROM MSE:     {mse_rom:.6e}")
-        print(f"Hybrid MSE:  {mse_hybrid:.6e}")
-        print(f"Improvement: {improvement:+.2f}%")
-
-    if plot:
-        _plot_hybrid_predictions(results, compare_ground_truth)
-
-    return results
 
 
 @torch.no_grad()

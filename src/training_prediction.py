@@ -366,6 +366,38 @@ from torchdiffeq import odeint as odeint_fwd
 from tqdm import tqdm
 
 
+def _make_lr_scheduler(optimizer, lr_scheduler_cfg, epochs):
+    if lr_scheduler_cfg is None:
+        return None, None
+
+    sched_type = lr_scheduler_cfg.get("type", None)
+
+    if sched_type == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=epochs,
+            eta_min=lr_scheduler_cfg.get("min_lr", 0.0),
+        )
+        step_on = "epoch"
+
+    elif sched_type == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=lr_scheduler_cfg.get("factor", 0.5),
+            patience=lr_scheduler_cfg.get("patience", 2),
+            threshold=lr_scheduler_cfg.get("threshold", 1e-6),
+            threshold_mode=lr_scheduler_cfg.get("threshold_mode", "rel"),
+            min_lr=lr_scheduler_cfg.get("min_lr", 0.0),
+            verbose=True,
+        )
+        step_on = "val"
+
+    else:
+        raise ValueError(f"Unknown lr scheduler type: {sched_type}")
+
+    return scheduler, step_on
+
 def _diagnose_rom_consistency(
     hybrid_model,
     t_shared,
@@ -415,19 +447,16 @@ def _diagnose_rom_consistency(
             "per_ic_max_abs": abs_diff.amax(dim=(1, 2)).detach().cpu(),  # [B]
         }
 
-    print("\nROM consistency diagnostic (augmented ROM vs precomputed ROM)")
-    print(f"  checked ICs: {n_check}")
-    print(f"  max|diff|   : {stats['max_abs']:.3e}")
-    print(f"  mean|diff|  : {stats['mean_abs']:.3e}")
-    print(f"  RMSE        : {stats['rmse']:.3e}")
-    print(f"  per-IC max|diff|: {stats['per_ic_max_abs'].numpy()}")
-
     # Heuristic warning threshold (tune if needed)
     if stats["max_abs"] > rom_consistency_tol:
+        print("\nROM consistency diagnostic (augmented ROM vs precomputed ROM)")
+        print(f"  checked ICs: {n_check}")
+        print(f"  max|diff|   : {stats['max_abs']:.3e}")
+        print(f"  mean|diff|  : {stats['mean_abs']:.3e}")
+        print(f"  RMSE        : {stats['rmse']:.3e}")
+        print(f"  per-IC max|diff|: {stats['per_ic_max_abs'].numpy()}")
         print("  ⚠ WARNING: ROM rollouts differ noticeably. "
               "Residual targets may be inconsistent with model ROM.")
-    else:
-        print("  ✓ ROM rollouts look consistent.")
 
     return stats
 
@@ -495,8 +524,7 @@ def train_hybrid_rom_neural_ode(
     print_every: int = 10,
     early_stopping_patience: int = 20,
     early_stopping_min_delta: float = 1e-7,
-    lr_schedule: str = "cosine",
-    lr_min: float = 1e-6,
+    lr_scheduler: dict | None = None,
     train_on_residuals: bool = True,
     pretrain_derivative: bool = True,
     pretrain_epochs: int = 10,
@@ -617,13 +645,7 @@ def train_hybrid_rom_neural_ode(
     # Optimizer (NN only)
     opt = torch.optim.Adam(hybrid_model.neural_ode.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # Scheduler
-    if lr_schedule == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr_min)
-    elif lr_schedule == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=50)
-    else:
-        scheduler = None
+    scheduler, scheduler_step_on = _make_lr_scheduler( opt, lr_scheduler_cfg=lr_scheduler, epochs=epochs)
 
     train_curve, val_curve, val_epochs = [], [], []
     best_val_loss, best_epoch, patience_counter, best_state = float("inf"), 0, 0, None
@@ -680,7 +702,7 @@ def train_hybrid_rom_neural_ode(
         train_loss = tot_loss / max(1, n_samples)
         train_curve.append(train_loss)
 
-        if scheduler is not None and lr_schedule != "plateau":
+        if scheduler is not None and scheduler_step_on == "epoch":
             scheduler.step()
 
         # Validation
@@ -715,7 +737,7 @@ def train_hybrid_rom_neural_ode(
                 val_curve.append(val_loss)
                 val_epochs.append(ep)
 
-            if scheduler is not None and lr_schedule == "plateau":
+            if scheduler is not None and scheduler_step_on == "val":
                 scheduler.step(val_loss)
 
             current_lr = opt.param_groups[0]["lr"]

@@ -389,7 +389,6 @@ def _make_lr_scheduler(optimizer, lr_scheduler_cfg, epochs):
             threshold=lr_scheduler_cfg.get("threshold", 1e-6),
             threshold_mode=lr_scheduler_cfg.get("threshold_mode", "rel"),
             min_lr=lr_scheduler_cfg.get("min_lr", 0.0),
-            verbose=True,
         )
         step_on = "val"
 

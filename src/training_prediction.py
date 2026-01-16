@@ -93,6 +93,41 @@ def _split_indices(M: int, val_frac: float, seed: int):
     train_ids = perm[n_val:]
     return train_ids, val_ids
 
+# =====================================================================
+# LR scheduler
+# =====================================================================
+
+def _make_lr_scheduler(optimizer, lr_scheduler_cfg, epochs):
+    if lr_scheduler_cfg is None:
+        return None, None
+
+    sched_type = lr_scheduler_cfg.get("type", None)
+
+    if sched_type == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=epochs,
+            eta_min=lr_scheduler_cfg.get("min_lr", 0.0),
+        )
+        step_on = "epoch"
+
+    elif sched_type == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=lr_scheduler_cfg.get("factor", 0.5),
+            patience=lr_scheduler_cfg.get("patience", 2),
+            threshold=lr_scheduler_cfg.get("threshold", 1e-6),
+            threshold_mode=lr_scheduler_cfg.get("threshold_mode", "rel"),
+            min_lr=lr_scheduler_cfg.get("min_lr", 0.0),
+        )
+        step_on = "val"
+
+    else:
+        raise ValueError(f"Unknown lr scheduler type: {sched_type}")
+
+    return scheduler, step_on
+
 
 # =====================================================================
 # Loss Functions
@@ -186,6 +221,7 @@ def pretrain_rhs_derivative_matching(
 # =====================================================================
 
 def train_neural_ode_on_neural_galerkin_dataset(
+    neural_ode_func,
     ds,
     val_frac: float = 0.25,
     split_seed: int = 0,
@@ -206,21 +242,19 @@ def train_neural_ode_on_neural_galerkin_dataset(
     pretrain_derivative: bool = True,
     pretrain_epochs: int = 200,
     pretrain_lr: float = 1e-3,
-    lr_schedule: str = "cosine",
-    lr: float = 1e-3,
-    lr_min: float = 1e-6,
+    lr_scheduler: dict | None = None,
     early_stopping_patience: int = 20,
     early_stopping_min_delta: float = 1e-7,
 ):
     """
     Train pure Neural ODE on dataset.
-    
+
     Returns:
         func: Trained Neural ODE
         info: Training information dictionary
     """
     from neural_ode import CoeffODEFunc
-    
+
     device = ds.c.device
     M, _, K = ds.c.shape
 
@@ -239,33 +273,30 @@ def train_neural_ode_on_neural_galerkin_dataset(
 
     train_ids, val_ids = _split_indices(M, val_frac=val_frac, seed=split_seed)
 
-    func = CoeffODEFunc(K, hidden=hidden, time_dependent=time_dependent, num_layers=num_layers).to(device)
-    
     print(f"\n{'='*60}")
     print("NEURAL ODE TRAINING")
     print(f"{'='*60}")
-    print(f"Parameters: {sum(p.numel() for p in func.parameters()):,}")
+    print(f"Parameters: {sum(p.numel() for p in neural_ode_func.parameters()):,}")
     print(f"Train ICs: {len(train_ids)}, Val ICs: {len(val_ids)}")
 
     # Derivative pretraining
     if pretrain_derivative and pretrain_epochs > 0:
-        func = pretrain_rhs_derivative_matching(
-            func, t=t_shared, C=C_train_space, train_ids=train_ids,
-            epochs=pretrain_epochs, lr=pretrain_lr,
+        neural_ode_func = pretrain_rhs_derivative_matching(
+            neural_ode_func,
+            t=t_shared,
+            C=C_train_space,
+            train_ids=train_ids,
+            epochs=pretrain_epochs,
+            lr=pretrain_lr,
             batch_ics=min(256, max(16, batch_ics)),
             time_batch=min(128, t_shared.numel()),
         )
 
     # Optimizer
-    opt = torch.optim.Adam(func.parameters(), lr=lr, weight_decay=weight_decay)
-    
+    opt = torch.optim.Adam(neural_ode_func.parameters(), lr=1e-3, weight_decay=weight_decay)
+
     # LR scheduler
-    if lr_schedule == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr_min)
-    elif lr_schedule == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=50)
-    else:
-        scheduler = None
+    scheduler, step_on = _make_lr_scheduler(opt, lr_scheduler, epochs)
 
     # Training loop
     train_curve = []
@@ -277,25 +308,23 @@ def train_neural_ode_on_neural_galerkin_dataset(
     best_state = None
 
     for ep in tqdm(range(1, epochs + 1), desc="Training Neural ODE"):
-        func.train()
-
+        neural_ode_func.train()
         perm = torch.randperm(len(train_ids), device=device)
         train_ids_shuf = [train_ids[int(i)] for i in perm.tolist()]
 
         tot = 0.0
         n = 0
-
         for s in range(0, len(train_ids_shuf), batch_ics):
             b_ids = train_ids_shuf[s : s + batch_ics]
             cB = C_train_space[b_ids]
 
             opt.zero_grad(set_to_none=True)
-            loss = _mse_ode_batch(func, t_shared, cB, method, rtol, atol, ode_options)
+            loss = _mse_ode_batch(neural_ode_func, t_shared, cB, method, rtol, atol, ode_options)
             loss.backward()
 
             if grad_clip is not None:
-                nn.utils.clip_grad_norm_(func.parameters(), grad_clip)
-            
+                nn.utils.clip_grad_norm_(neural_ode_func.parameters(), grad_clip)
+
             opt.step()
 
             tot += float(loss.detach().item()) * len(b_ids)
@@ -304,39 +333,39 @@ def train_neural_ode_on_neural_galerkin_dataset(
         train_mse = tot / max(1, n)
         train_curve.append(train_mse)
 
-        if scheduler is not None and lr_schedule != "plateau":
+        if scheduler is not None and step_on == "epoch":
             scheduler.step()
 
         # Validation
         if len(val_ids) > 0 and (ep % print_every == 0 or ep == epochs):
             val_batch = min(64, batch_ics)
-            val_mse = eval_mse_ode(func, t_shared, C_train_space, val_ids, val_batch, method, rtol, atol, ode_options)
+            val_mse = eval_mse_ode(neural_ode_func, t_shared, C_train_space, val_ids, val_batch, method, rtol, atol, ode_options)
             val_curve.append(val_mse)
             val_epochs.append(ep)
-            
-            if scheduler is not None and lr_schedule == "plateau":
+
+            if scheduler is not None and step_on == "val":
                 scheduler.step(val_mse)
-            
+
             current_lr = opt.param_groups[0]['lr']
             print(f"Epoch {ep:4d} | Train: {train_mse:.6e}, Val: {val_mse:.6e} | "
                   f"LR: {current_lr:.6e}, Patience: {patience_counter}/{early_stopping_patience}")
-            
+
             if val_mse < best_val_loss - early_stopping_min_delta:
                 best_val_loss = val_mse
                 best_epoch = ep
                 patience_counter = 0
-                best_state = {k: v.cpu().clone() for k, v in func.state_dict().items()}
+                best_state = {k: v.cpu().clone() for k, v in neural_ode_func.state_dict().items()}
                 print(f"  ✓ New best model!")
             else:
                 patience_counter += print_every
-            
+
             if patience_counter >= early_stopping_patience:
                 print(f"\nEarly stopping at epoch {ep}")
                 break
-    
+
     # Restore best model
     if best_state is not None:
-        func.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+        neural_ode_func.load_state_dict({k: v.to(device) for k, v in best_state.items()})
         print(f"\n✓ Restored best model from epoch {best_epoch}")
 
     # Plot
@@ -354,8 +383,8 @@ def train_neural_ode_on_neural_galerkin_dataset(
         "best_val_loss": best_val_loss,
         "final_train_loss": train_curve[best_epoch-1] if best_epoch > 0 else train_curve[-1],
     }
-    return func, info
 
+    return neural_ode_func, info
 
 # =====================================================================
 # Training: Hybrid ROM + Neural ODE
@@ -365,38 +394,6 @@ import torch
 import torch.nn as nn
 from torchdiffeq import odeint as odeint_fwd
 from tqdm import tqdm
-
-
-def _make_lr_scheduler(optimizer, lr_scheduler_cfg, epochs):
-    if lr_scheduler_cfg is None:
-        return None, None
-
-    sched_type = lr_scheduler_cfg.get("type", None)
-
-    if sched_type == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=epochs,
-            eta_min=lr_scheduler_cfg.get("min_lr", 0.0),
-        )
-        step_on = "epoch"
-
-    elif sched_type == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=lr_scheduler_cfg.get("factor", 0.5),
-            patience=lr_scheduler_cfg.get("patience", 2),
-            threshold=lr_scheduler_cfg.get("threshold", 1e-6),
-            threshold_mode=lr_scheduler_cfg.get("threshold_mode", "rel"),
-            min_lr=lr_scheduler_cfg.get("min_lr", 0.0),
-        )
-        step_on = "val"
-
-    else:
-        raise ValueError(f"Unknown lr scheduler type: {sched_type}")
-
-    return scheduler, step_on
 
 def _diagnose_rom_consistency(
     hybrid_model,
@@ -814,7 +811,7 @@ def train_hybrid_rom_neural_ode(
 # =====================================================================
 
 @torch.no_grad()
-def predict(
+def predict_test(
     func,
     dataset,
     ic_idx=0,
@@ -946,7 +943,7 @@ def predict(
 
 
 @torch.no_grad()
-def predict_and_plot_vs_reference_surface(
+def predict_and_comparison_plot(
     func, ds, u0_callable, t_vals, z_vals, X_ref,
     method="dopri5", rtol=1e-6, atol=1e-6, ode_options=None,
     notebook_plot=True, transform=None, is_hybrid=False,
@@ -997,14 +994,14 @@ def predict_and_plot_vs_reference_surface(
     X_ref = np.asarray(X_ref, dtype=float)
 
     title_pred = "u_pred (Hybrid)" if is_hybrid else "u_pred (Neural ODE)"
-    plot_sim_result(z_vals, t_vals, U_pred_tz, title_pred, notebook_plot=notebook_plot)
-    plot_sim_result(z_vals, t_vals, X_ref, "u_ref", notebook_plot=notebook_plot)
-    plot_sim_result(z_vals, t_vals, np.abs(X_ref - U_pred_tz), "abs error", notebook_plot=notebook_plot)
 
     if is_hybrid:
         U_rom_tx = ds.reconstruct_u(c_rom, denormalize=True)
         U_rom_tz = _u_to_numpy_on_zgrid(U_rom_tx.detach().cpu().numpy(), x_grid, np.asarray(z_vals, float))
         plot_sim_result(z_vals, t_vals, U_rom_tz, "u_ROM", notebook_plot=notebook_plot)
+    plot_sim_result(z_vals, t_vals, U_pred_tz, title_pred, notebook_plot=notebook_plot)
+    plot_sim_result(z_vals, t_vals, X_ref, "u_ref", notebook_plot=notebook_plot)
+    plot_sim_result(z_vals, t_vals, np.abs(X_ref - U_pred_tz), "abs error", notebook_plot=notebook_plot)
 
     return {
         "t_phys": t_vals,
@@ -1030,7 +1027,7 @@ def eval_hybrid_val_mse(
 ):
     """
     Returns mean MSE over val_ids in coefficient space.
-    Batched over initial conditions to avoid Python loop overhead.
+    Batched over initial conditions.
     """
     device = C_all.device
     hybrid_model.eval()
@@ -1059,11 +1056,6 @@ def eval_hybrid_val_mse(
         n += len(b_ids)
 
     return mse_sum / max(1, n)
-
-
-
-
-
 
 # =====================================================================
 # Visualization Functions
@@ -1094,8 +1086,8 @@ def _plot_training_curves(train_curve, val_curve, val_epochs, best_epoch, title=
 def _plot_predictions(results, reconstruct, compare_ground_truth):
     """
     Unified plotter:
-      - Non-hybrid: plots predicted vs true (same as before).
-      - Hybrid: additionally plots ROM baseline with same visual style.
+      - Non-hybrid: plots predicted vs true.
+      - Hybrid: additionally plots ROM baseline.
     Expects:
       results["t_phys"], results["c_pred_phys"]
       optionally results["c_true_phys"]

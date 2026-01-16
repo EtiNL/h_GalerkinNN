@@ -1,5 +1,5 @@
 """
-Neural ODE Model and Utilities
+Neural ODE Models and Utilities
 ================================
 Core Neural ODE components and utility functions.
 """
@@ -8,6 +8,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+from homogeneous_nn.hnn import HomogeneousNN
 
 
 # =====================================================================
@@ -85,6 +86,89 @@ class CoeffODEFunc(nn.Module):
         if squeeze_back:
             out = out.squeeze(0)
         return out
+
+
+
+# =====================================================================
+# homogeneous Neural ODE Model
+# =====================================================================
+
+class hCoeffODEFunc(nn.Module):
+    """
+    homogeneous Neural ODE function for learning dynamics in coefficient space.
+    
+    Args:
+        K: Number of Galerkin modes
+        hidden: Hidden layer size
+        time_dependent: If True, concatenate time to input
+    """
+    
+    def __init__(self, K: int, Gd, P,  nu, hidden: int = 256, time_dependent: bool = True, num_layers: int = 1):
+        super().__init__()
+        self.time_dependent = time_dependent
+        inp = K + (1 if time_dependent else 0)
+        
+        layers = []
+        layers.append(nn.Linear(inp, hidden))
+        layers.append(nn.Tanh())
+        for i in range(num_layers):
+            layers.append(nn.Linear(hidden, hidden))
+        layers.append(nn.Tanh())
+        layers.append(nn.Linear(hidden, K))
+        
+        self.net = HomogeneousNN(inp, hidden, K, P=P, Gd=Gd, nu=nu, hidden_layers=num_layers)
+        
+        # Initialize weights
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.5)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, t, c):
+        """
+        Forward pass.
+        
+        Args:
+            t: time scalar () or (B,)
+            c: state (K,) or (B, K)
+        
+        Returns:
+            dc/dt: same shape as c
+        """
+        squeeze_back = False
+        if c.ndim == 1:
+            c = c.unsqueeze(0)
+            squeeze_back = True
+
+        B = c.shape[0]
+
+        if self.time_dependent:
+            t = t.to(device=c.device)
+
+            if t.ndim == 0:
+                tt = t.to(dtype=c.dtype).expand(B, 1)
+            elif t.ndim == 1:
+                if t.shape[0] == 1:
+                    tt = t.to(dtype=c.dtype).expand(B, 1)
+                else:
+                    assert t.shape[0] == B, f"Time batch size {t.shape[0]} != state batch size {B}"
+                    tt = t.to(dtype=c.dtype).view(B, 1)
+            else:
+                raise ValueError(f"Unsupported time tensor shape {t.shape}")
+
+            x = torch.cat([c, tt], dim=1)
+        else:
+            x = c
+
+        out = self.net(x)
+        if squeeze_back:
+            out = out.squeeze(0)
+        return out
+
+
+
+
+
 
 
 # =====================================================================

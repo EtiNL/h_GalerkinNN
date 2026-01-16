@@ -143,7 +143,11 @@ def _mse_ode_batch(func, t, cB, method, rtol, atol, ode_options, use_adjoint=Tru
     y0 = cB[:, 0, :]
     if use_adjoint:
         # Adjoint method: O(1) memory w.r.t. number of solver steps
-        pred_tBK = odeint_adjoint(func, y0, t, method=method, rtol=rtol, atol=atol, options=ode_options)
+        pred_tBK = odeint_adjoint(
+            func, y0, t,
+            method=method, rtol=rtol, atol=atol, options=ode_options,
+            adjoint_params=tuple(func.parameters())  # explicitly specify to avoid graph retention
+        )
     else:
         # Standard method: stores all intermediate states (memory hungry)
         pred_tBK = odeint_fwd(func, y0, t, method=method, rtol=rtol, atol=atol, options=ode_options)

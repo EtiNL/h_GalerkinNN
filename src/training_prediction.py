@@ -307,8 +307,10 @@ def train_neural_ode_on_neural_galerkin_dataset(
             time_batch=min(128, t_shared.numel()),
         )
 
-    # Optimizer
-    opt = torch.optim.Adam(neural_ode_func.parameters(), lr=1e-3, weight_decay=weight_decay)
+    # Optimizer - use lr from scheduler config if provided
+    init_lr = lr_scheduler.get("lr", 1e-3) if lr_scheduler else 1e-3
+    opt = torch.optim.Adam(neural_ode_func.parameters(), lr=init_lr, weight_decay=weight_decay)
+    print(f"Initial LR: {init_lr:.6e}, Weight decay: {weight_decay:.6e}")
 
     # LR scheduler
     scheduler, step_on = _make_lr_scheduler(opt, lr_scheduler, epochs)
@@ -652,8 +654,10 @@ def train_hybrid_rom_neural_ode(
             time_batch=min(128, t_shared.numel()),
         )
 
-    # Optimizer (NN only)
-    opt = torch.optim.Adam(hybrid_model.neural_ode.parameters(), lr=lr, weight_decay=weight_decay)
+    # Optimizer (NN only) - lr_scheduler["lr"] overrides lr param if provided
+    init_lr = lr_scheduler.get("lr", lr) if lr_scheduler else lr
+    opt = torch.optim.Adam(hybrid_model.neural_ode.parameters(), lr=init_lr, weight_decay=weight_decay)
+    print(f"Initial LR: {init_lr:.6e}, Weight decay: {weight_decay:.6e}")
 
     scheduler, scheduler_step_on = _make_lr_scheduler( opt, lr_scheduler_cfg=lr_scheduler, epochs=epochs)
 

@@ -21,10 +21,11 @@ import os
 from scipy.special import eval_hermite, factorial
 
 # Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Need to go up to src/ directory to import burgers_analytic_np
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # Import the Burgers solver from existing module
-from burgers_analytic import num_approx_burgers
+from burgers_analytic_np import num_approx_burgers
 
 # Import from pde_dataset package (adjust path as needed)
 try:
@@ -172,7 +173,6 @@ class BurgersSolution:
         ht: float = 0.05,
         Tmax: float = 5.0,
         z_range: Tuple[float, float] = (-7.0, 7.0),
-        L: float = 6.0,
         compute_on_init: bool = True
     ):
         """
@@ -192,7 +192,6 @@ class BurgersSolution:
         self.ht = ht
         self.Tmax = Tmax
         self.z_range = z_range
-        self.L = L
         
         self._z_vals = None
         self._t_vals = None
@@ -211,7 +210,6 @@ class BurgersSolution:
             ht=self.ht,
             Tmax=self.Tmax,
             z_range=self.z_range,
-            L=self.L
         )
         
         # Update z_range from actual computed values
@@ -524,7 +522,6 @@ def create_burgers_NeuralGalerkin_dataset(
     hz: float = 0.1,
     Tmax: float = 5.0,
     z_range: tuple[float, float] = (-7.0, 7.0),
-    L: float = 6.0,
     n_basis: int = 5,
     n_time_samples: int = 200,
     t_sampling: str = "grid",
@@ -570,7 +567,7 @@ def create_burgers_NeuralGalerkin_dataset(
         solutions = [
             BurgersSolution(
                 initial_condition=ic,
-                hz=hz, ht=ht, Tmax=Tmax, L=L, z_range=z_range
+                hz=hz, ht=ht, Tmax=Tmax, z_range=z_range
             )
             for ic in initial_conditions
         ]
@@ -768,6 +765,6 @@ if __name__ == '__main__':
     # )
 
     gaussians_neural_galerkin_dataset = create_burgers_NeuralGalerkin_dataset(
-        hz=0.1, Tmax=2.0, L=10.0, device='cuda', n_basis = 5,
+        hz=0.1, Tmax=2.0, device='cuda', n_basis = 5,
     )
     gaussians_neural_galerkin_dataset.save(f"burgers_datasets/gaussian_neural_galerkin_ds.npz")

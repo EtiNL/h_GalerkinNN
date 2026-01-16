@@ -9,7 +9,7 @@ import torch.nn as nn
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from tqdm import tqdm
-from torchdiffeq import odeint as odeint_fwd
+from torchdiffeq import odeint as odeint_fwd, odeint_adjoint
 
 from neural_ode import (
     AffineCoeffTransform,
@@ -133,10 +133,20 @@ def _make_lr_scheduler(optimizer, lr_scheduler_cfg, epochs):
 # Loss Functions
 # =====================================================================
 
-def _mse_ode_batch(func, t, cB, method, rtol, atol, ode_options):
-    """Compute MSE loss for a batch."""
+def _mse_ode_batch(func, t, cB, method, rtol, atol, ode_options, use_adjoint=True):
+    """Compute MSE loss for a batch.
+
+    Args:
+        use_adjoint: If True, use adjoint method for O(1) memory backprop.
+                     This is essential for training to avoid OOM errors.
+    """
     y0 = cB[:, 0, :]
-    pred_tBK = odeint_fwd(func, y0, t, method=method, rtol=rtol, atol=atol, options=ode_options)
+    if use_adjoint:
+        # Adjoint method: O(1) memory w.r.t. number of solver steps
+        pred_tBK = odeint_adjoint(func, y0, t, method=method, rtol=rtol, atol=atol, options=ode_options)
+    else:
+        # Standard method: stores all intermediate states (memory hungry)
+        pred_tBK = odeint_fwd(func, y0, t, method=method, rtol=rtol, atol=atol, options=ode_options)
     pred_BtK = pred_tBK.permute(1, 0, 2).contiguous()
     return torch.mean((pred_BtK - cB) ** 2)
 
@@ -389,11 +399,6 @@ def train_neural_ode_on_neural_galerkin_dataset(
 # =====================================================================
 # Training: Hybrid ROM + Neural ODE
 # =====================================================================
-
-import torch
-import torch.nn as nn
-from torchdiffeq import odeint as odeint_fwd
-from tqdm import tqdm
 
 def _diagnose_rom_consistency(
     hybrid_model,

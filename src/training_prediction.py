@@ -255,6 +255,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
     lr_scheduler: dict | None = None,
     early_stopping_patience: int = 20,
     early_stopping_min_delta: float = 1e-7,
+    use_adjoint=True,
 ):
     """
     Train pure Neural ODE on dataset.
@@ -329,7 +330,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
             cB = C_train_space[b_ids]
 
             opt.zero_grad(set_to_none=True)
-            loss = _mse_ode_batch(neural_ode_func, t_shared, cB, method, rtol, atol, ode_options)
+            loss = _mse_ode_batch(neural_ode_func, t_shared, cB, method, rtol, atol, ode_options, use_adjoint=use_adjoint)
             loss.backward()
 
             if grad_clip is not None:

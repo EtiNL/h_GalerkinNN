@@ -173,18 +173,21 @@ class BurgersSolution:
         ht: float = 0.05,
         Tmax: float = 5.0,
         z_range: Tuple[float, float] = (-7.0, 7.0),
+        n_quad: int = 20,
+        quadrature_method: str = 'adaptive',
         compute_on_init: bool = True
     ):
         """
         Initialize Burgers solution.
-        
+
         Args:
             initial_condition: Initial condition specification
             hz: Spatial step size
             ht: Time step size
             Tmax: Final time
             z_range: Spatial domain (used for bounds, actual grid is from burgers_analytic)
-            L: Integration limit for Cole-Hopf quadrature
+            n_quad: Number of quadrature points for Gauss-Hermite (default 20)
+            quadrature_method: Quadrature method ('gauss-hermite' or 'adaptive')
             compute_on_init: Whether to compute solution immediately
         """
         self.ic = initial_condition
@@ -192,12 +195,14 @@ class BurgersSolution:
         self.ht = ht
         self.Tmax = Tmax
         self.z_range = z_range
-        
+        self.n_quad = n_quad
+        self.quadrature_method = quadrature_method
+
         self._z_vals = None
         self._t_vals = None
         self._U = None
         self._interpolator = None
-        
+
         if compute_on_init:
             self.compute()
     
@@ -210,6 +215,8 @@ class BurgersSolution:
             ht=self.ht,
             Tmax=self.Tmax,
             z_range=self.z_range,
+            n_quad=self.n_quad,
+            quadrature_method=self.quadrature_method
         )
         
         # Update z_range from actual computed values
@@ -311,7 +318,8 @@ def create_burgers_pinn_dataset(
     hz: float = 0.1,
     ht: float = 0.05,
     Tmax: float = 5.0,
-    L: float = 6.0,
+    n_quad: int = 20,
+    quadrature_method: str = 'adaptive',
     n_collocation: int = 10000,
     n_boundary: int = 2000,
     n_initial: int = 2000,
@@ -323,12 +331,13 @@ def create_burgers_pinn_dataset(
 ) -> PINNDataset:
     """
     Create a PINN dataset from Burgers equation solution.
-    
+
     Args:
         initial_condition: Initial condition (default: sine)
         hz, ht: Grid spacing for solution computation
         Tmax: Final time
-        L: Integration limit for Cole-Hopf quadrature
+        n_quad: Number of quadrature points for Gauss-Hermite
+        quadrature_method: Quadrature method ('gauss-hermite' or 'adaptive')
         n_collocation: Number of interior collocation points
         n_boundary: Number of boundary points
         n_initial: Number of initial condition points
@@ -337,20 +346,21 @@ def create_burgers_pinn_dataset(
         device: Device for tensors
         seed: Random seed
         precomputed_solution: Use existing solution instead of computing
-        
+
     Returns:
         PINNDataset configured for Burgers equation
     """
     if initial_condition is None:
         initial_condition = BurgersInitialConditions.sine()
-    
+
     # Get or compute solution
     if precomputed_solution is not None:
         solution = precomputed_solution
     else:
         solution = BurgersSolution(
             initial_condition=initial_condition,
-            hz=hz, ht=ht, Tmax=Tmax, L=L
+            hz=hz, ht=ht, Tmax=Tmax,
+            n_quad=n_quad, quadrature_method=quadrature_method
         )
     
     # Create dataset
@@ -373,7 +383,8 @@ def create_burgers_sequential_dataset(
     hz: float = 0.1,
     ht: float = 0.05,
     Tmax: float = 5.0,
-    L: float = 6.0,
+    n_quad: int = 20,
+    quadrature_method: str = 'adaptive',
     seq_length: int = 10,
     pred_length: int = 1,
     stride: int = 1,
@@ -383,32 +394,34 @@ def create_burgers_sequential_dataset(
 ) -> SequentialPDEDataset:
     """
     Create a sequential (LSTM/RNN) dataset from Burgers equation solution.
-    
+
     Args:
         initial_condition: Initial condition (default: sine)
         hz, ht: Grid spacing for solution computation
         Tmax: Final time
-        L: Integration limit for Cole-Hopf quadrature
+        n_quad: Number of quadrature points for Gauss-Hermite
+        quadrature_method: Quadrature method ('gauss-hermite' or 'adaptive')
         seq_length: Number of input time steps
         pred_length: Number of output time steps to predict
         stride: Stride between sequences
         device: Device for tensors
         normalize: Whether to normalize data
         precomputed_solution: Use existing solution instead of computing
-        
+
     Returns:
         SequentialPDEDataset configured for Burgers equation
     """
     if initial_condition is None:
         initial_condition = BurgersInitialConditions.sine()
-    
+
     # Get or compute solution
     if precomputed_solution is not None:
         solution = precomputed_solution
     else:
         solution = BurgersSolution(
             initial_condition=initial_condition,
-            hz=hz, ht=ht, Tmax=Tmax, L=L
+            hz=hz, ht=ht, Tmax=Tmax,
+            n_quad=n_quad, quadrature_method=quadrature_method
         )
     
     # Get meshgrid data
@@ -431,7 +444,8 @@ def create_burgers_galerkin_dataset(
     hz: float = 0.1,
     ht: float = 0.05,
     Tmax: float = 5.0,
-    L: float = 6.0,
+    n_quad: int = 20,
+    quadrature_method: str = 'adaptive',
     t_snapshot: float = None,
     n_quadrature: int = 512,
     quadrature_type: str = 'gauss-legendre',
@@ -440,38 +454,40 @@ def create_burgers_galerkin_dataset(
 ) -> GalerkinDataset:
     """
     Create a Galerkin NN dataset from Burgers equation solution.
-    
+
     For Galerkin methods, we typically work with a single time snapshot
     or use the steady-state solution. This creates quadrature points
     for the spatial domain at a specific time.
-    
+
     Args:
         initial_condition: Initial condition (default: sine)
         hz, ht: Grid spacing for solution computation
         Tmax: Final time
-        L: Integration limit for Cole-Hopf quadrature
+        n_quad: Number of quadrature points for Gauss-Hermite in Cole-Hopf transform
+        quadrature_method: Quadrature method for Cole-Hopf ('gauss-hermite' or 'adaptive')
         t_snapshot: Time at which to take snapshot (default: Tmax/2)
-        n_quadrature: Number of quadrature points
-        quadrature_type: Type of quadrature rule
+        n_quadrature: Number of quadrature points for Galerkin spatial integration
+        quadrature_type: Type of quadrature rule for Galerkin
         device: Device for tensors
         precomputed_solution: Use existing solution instead of computing
-        
+
     Returns:
         GalerkinDataset configured for Burgers equation
     """
     if initial_condition is None:
         initial_condition = BurgersInitialConditions.sine()
-    
+
     if t_snapshot is None:
         t_snapshot = Tmax / 2
-    
+
     # Get or compute solution
     if precomputed_solution is not None:
         solution = precomputed_solution
     else:
         solution = BurgersSolution(
             initial_condition=initial_condition,
-            hz=hz, ht=ht, Tmax=Tmax, L=L
+            hz=hz, ht=ht, Tmax=Tmax,
+            n_quad=n_quad, quadrature_method=quadrature_method
         )
     
     # Create solution function at specific time
@@ -522,6 +538,8 @@ def create_burgers_NeuralGalerkin_dataset(
     hz: float = 0.1,
     Tmax: float = 5.0,
     z_range: tuple[float, float] = (-7.0, 7.0),
+    n_quad: int = 20,
+    quadrature_method: str = 'adaptive',
     n_basis: int = 5,
     n_time_samples: int = 200,
     t_sampling: str = "grid",
@@ -567,7 +585,8 @@ def create_burgers_NeuralGalerkin_dataset(
         solutions = [
             BurgersSolution(
                 initial_condition=ic,
-                hz=hz, ht=ht, Tmax=Tmax, z_range=z_range
+                hz=hz, ht=ht, Tmax=Tmax, z_range=z_range,
+                n_quad=n_quad, quadrature_method=quadrature_method
             )
             for ic in initial_conditions
         ]
@@ -619,33 +638,36 @@ def generate_all_burgers_datasets(
     hz: float = 0.1,
     ht: float = 0.05,
     Tmax: float = 5.0,
-    L: float = 6.0,
+    n_quad: int = 20,
+    quadrature_method: str = 'adaptive',
     device: str = 'cpu',
     save_path: str = None,
     **kwargs
 ) -> Dict[str, Any]:
     """
     Generate datasets for all architectures from a single Burgers solution.
-    
+
     Args:
         initial_condition: Initial condition
         hz, ht, Tmax: Solution parameters
-        L: Integration limit for Cole-Hopf quadrature
+        n_quad: Number of quadrature points for Gauss-Hermite
+        quadrature_method: Quadrature method ('gauss-hermite' or 'adaptive')
         device: Device for tensors
         save_path: Optional path prefix for saving datasets
         **kwargs: Additional arguments passed to individual factories
-        
+
     Returns:
         Dictionary with 'pinn', 'sequential', 'galerkin' datasets and 'solution'
     """
     if initial_condition is None:
         initial_condition = BurgersInitialConditions.sine()
-    
+
     # Compute solution once
     print(f"Computing Burgers solution: {initial_condition.description}")
     solution = BurgersSolution(
         initial_condition=initial_condition,
-        hz=hz, ht=ht, Tmax=Tmax, L=L
+        hz=hz, ht=ht, Tmax=Tmax,
+        n_quad=n_quad, quadrature_method=quadrature_method
     )
     
     # Create all datasets
@@ -681,7 +703,9 @@ def generate_all_burgers_datasets(
     ng_kwargs = {k: v for k, v in kwargs.items() if k in ['n_basis','n_time_samples','t_sampling','normalize_t','normalize_c','seed']}
     neural_galerkin_dataset = create_burgers_NeuralGalerkin_dataset(
         initial_conditions=[initial_condition],  # or a list
-        hz=hz, Tmax=Tmax, L=L, device=device, **ng_kwargs
+        hz=hz, Tmax=Tmax,
+        n_quad=n_quad, quadrature_method=quadrature_method,
+        device=device, **ng_kwargs
     )
     
     result = {
@@ -713,22 +737,31 @@ def get_burgers_solution_function(
     hz: float = 0.1,
     ht: float = 0.05,
     Tmax: float = 5.0,
-    L: float = 6.0
+    n_quad: int = 20,
+    quadrature_method: str = 'adaptive'
 ) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
     """
     Get a callable solution function for Burgers equation.
-    
+
+    Args:
+        initial_condition: Initial condition (default: sine)
+        hz, ht: Grid spacing
+        Tmax: Final time
+        n_quad: Number of quadrature points for Gauss-Hermite
+        quadrature_method: Quadrature method ('gauss-hermite' or 'adaptive')
+
     Returns:
         Function (t, x) -> u that can be used with pde_dataset factories
     """
     if initial_condition is None:
         initial_condition = BurgersInitialConditions.sine()
-    
+
     solution = BurgersSolution(
         initial_condition=initial_condition,
-        hz=hz, ht=ht, Tmax=Tmax, L=L
+        hz=hz, ht=ht, Tmax=Tmax,
+        n_quad=n_quad, quadrature_method=quadrature_method
     )
-    
+
     return solution
 
 
@@ -737,22 +770,31 @@ def get_burgers_generator(
     hz: float = 0.1,
     ht: float = 0.05,
     Tmax: float = 5.0,
-    L: float = 6.0
+    n_quad: int = 20,
+    quadrature_method: str = 'adaptive'
 ) -> Generator[Tuple[np.ndarray, np.ndarray, np.ndarray], None, None]:
     """
     Get a generator yielding (t, x, u) tuples for Burgers equation.
-    
+
+    Args:
+        initial_condition: Initial condition (default: sine)
+        hz, ht: Grid spacing
+        Tmax: Final time
+        n_quad: Number of quadrature points for Gauss-Hermite
+        quadrature_method: Quadrature method ('gauss-hermite' or 'adaptive')
+
     Returns:
         Generator compatible with pde_dataset generator-based factories
     """
     if initial_condition is None:
         initial_condition = BurgersInitialConditions.sine()
-    
+
     solution = BurgersSolution(
         initial_condition=initial_condition,
-        hz=hz, ht=ht, Tmax=Tmax, L=L
+        hz=hz, ht=ht, Tmax=Tmax,
+        n_quad=n_quad, quadrature_method=quadrature_method
     )
-    
+
     return solution.generator()
 
 if __name__ == '__main__':

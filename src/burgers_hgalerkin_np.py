@@ -60,10 +60,30 @@ def compute_alpha(Phi, An, Bn, Gdn):
     den = Phi @ (Gdn) @ Phi.T
     return num/den
             
-def num_approx_hgalerkin(x0, n, hz, ht, Tmax, z_range = (-7.0, 7.0)):
+def num_approx_hgalerkin(x0, n, hz, ht, Tmax, z_range = (-7.0, 7.0), quadrature_method='adaptive'):
+    """
+    Compute Burgers solution using homogeneous Galerkin projection with Hermite basis.
+
+    Args:
+        x0: Initial condition function
+        n: Number of basis functions (dimension of projection subspace)
+        hz: Spatial step size
+        ht: Time step size
+        Tmax: Final time
+        z_range: Spatial domain (z_min, z_max)
+        quadrature_method: Quadrature method (default 'adaptive')
+            - 'adaptive': Scipy adaptive quadrature (used for all integrals)
+
+    Returns:
+        z_vals, t_vals, X_gal: Spatial grid, time grid, and solution array
+    """
     nu = 2
 
     assert z_range[0] < z_range[1], f"z_range not defined correctly: {z_range}"
+    assert quadrature_method == 'adaptive', \
+        f"Only 'adaptive' quadrature is currently supported in num_approx_hgalerkin, got '{quadrature_method}'"
+
+    print(f"Using {quadrature_method} quadrature for homogeneous Galerkin projection")
 
     # -------- grid --------
     z_vals = np.arange(z_range[0], z_range[1] + hz, hz)

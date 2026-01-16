@@ -35,16 +35,22 @@ class CoeffODEFunc(nn.Module):
         layers.append(nn.Tanh())
         for i in range(num_layers):
             layers.append(nn.Linear(hidden, hidden))
-        layers.append(nn.Tanh())
+            layers.append(nn.Tanh())  # activation after each hidden layer
         layers.append(nn.Linear(hidden, K))
-        
+
         self.net = nn.Sequential(*layers)
-        
-        # Initialize weights
+
+        # Initialize hidden layer weights
         for m in self.net.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.5)
                 nn.init.zeros_(m.bias)
+
+        # Initialize last layer to output near-zero (critical for stable ODE training)
+        # This prevents the ODE solver from taking tiny steps early in training
+        final_layer = self.net[-1]
+        nn.init.normal_(final_layer.weight, mean=0.0, std=1e-4)
+        nn.init.zeros_(final_layer.bias)
 
     def forward(self, t, c):
         """

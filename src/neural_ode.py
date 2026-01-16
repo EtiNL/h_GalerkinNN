@@ -18,24 +18,33 @@ from homogeneous_nn.hnn import HomogeneousNN
 class CoeffODEFunc(nn.Module):
     """
     Neural ODE function for learning dynamics in coefficient space.
-    
+
     Args:
         K: Number of Galerkin modes
         hidden: Hidden layer size
         time_dependent: If True, concatenate time to input
+        activation: Activation function - 'tanh', 'silu', or 'gelu'
     """
-    
-    def __init__(self, K: int, hidden: int = 256, time_dependent: bool = True, num_layers: int = 1):
+
+    def __init__(self, K: int, hidden: int = 256, time_dependent: bool = True,
+                 num_layers: int = 1, activation: str = "silu"):
         super().__init__()
         self.time_dependent = time_dependent
         inp = K + (1 if time_dependent else 0)
-        
+
+        # Select activation function
+        act_fn = {
+            "tanh": nn.Tanh,
+            "silu": nn.SiLU,  # Swish - smooth, non-saturating
+            "gelu": nn.GELU,
+        }.get(activation.lower(), nn.SiLU)
+
         layers = []
         layers.append(nn.Linear(inp, hidden))
-        layers.append(nn.Tanh())
+        layers.append(act_fn())
         for i in range(num_layers):
             layers.append(nn.Linear(hidden, hidden))
-            layers.append(nn.Tanh())  # activation after each hidden layer
+            layers.append(act_fn())  # activation after each hidden layer
         layers.append(nn.Linear(hidden, K))
 
         self.net = nn.Sequential(*layers)

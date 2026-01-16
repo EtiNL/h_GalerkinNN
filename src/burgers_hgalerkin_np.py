@@ -2,7 +2,7 @@ import numpy as np
 from scipy.integrate import quad
 from scipy.special import eval_hermite, factorial
 from scipy.linalg import inv
-from homogeneity_utils import norm_d, dilation, dilation_n, compute_Gdn, radial_angular_decomp
+from homogeneity_utils_np import norm_d, dilation, dilation_n, compute_Gdn, radial_angular_decomp
 from tqdm import tqdm
 
 

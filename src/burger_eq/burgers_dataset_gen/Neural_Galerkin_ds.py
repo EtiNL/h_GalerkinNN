@@ -152,8 +152,6 @@ def burgers_neural_ds(
     n_time_samples: int = 200,
     t_sampling: str = "grid",
     seed: int = 0,
-    normalize_t: bool = False,
-    normalize_c: bool = False,
     dtype: torch.dtype = torch.float32,
     orthonormalize: bool = True,
     hermite_scale: float | None = None,
@@ -295,8 +293,6 @@ def burgers_neural_ds(
         n_time_samples=int(T_all.shape[1]),
         t_sampling=t_sampling,
         seed=seed,
-        normalize_t=normalize_t,
-        normalize_c=normalize_c,
         return_k_coords=False,
         pde_name="burgers",
     )
@@ -341,8 +337,6 @@ if __name__ == "__main__":
         n_time_samples=200,
         t_sampling="grid",
         seed=42,
-        normalize_t=False,
-        normalize_c=False,
         dtype=torch.float32,
     )
 

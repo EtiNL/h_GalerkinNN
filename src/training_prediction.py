@@ -15,7 +15,6 @@ from neural_ode import (
     AffineCoeffTransform,
     rollout,
     project_u0_to_c0_stored,
-    _to_stored_time,
     _u_to_numpy_on_zgrid,
 )
 
@@ -296,7 +295,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
 
     # Optional whitening
     transform = None
-    if whiten_if_needed and not ds.config.normalize_c:
+    if whiten_if_needed:
         mean = torch.as_tensor(ds.c_mean, device=device, dtype=ds.c.dtype).squeeze(0)
         std = torch.as_tensor(ds.c_std, device=device, dtype=ds.c.dtype).squeeze(0)
         transform = AffineCoeffTransform(mean, std)
@@ -878,17 +877,16 @@ def predict_neural_ode(
     device = ds.c.device
 
     t_phys = torch.tensor(t_vals, device=device, dtype=ds.t.dtype)
-    t_stored = _to_stored_time(ds, t_phys)
-    t_stored, _ = torch.sort(t_stored)
+    t_phys, _ = torch.sort(t_phys)
 
     c0_stored = project_u0_to_c0_stored(ds, u0_callable)
     c0_train = transform.encode(c0_stored) if transform is not None else c0_stored
 
-    c_pred = rollout(func, t_stored, c0_train, method, rtol, atol, ode_options)
+    c_pred = rollout(func, t_phys, c0_train, method, rtol, atol, ode_options)
     if transform is not None:
         c_pred = transform.decode(c_pred)
 
-    U_pred_tx = ds.reconstruct_u(c_pred, denormalize=True).detach().cpu().numpy()
+    U_pred_tx = ds.reconstruct_u(c_pred, ).detach().cpu().numpy()
     x_grid = ds.get_reconstruction_grid()
     return _u_to_numpy_on_zgrid(U_pred_tx, x_grid, np.asarray(z_vals, float))
 
@@ -955,16 +953,11 @@ def predict_test(
         if is_hybrid:
             c_rom, r = c_rom_tr, r_tr
 
-    # --- physical space ---
-    c_pred_phys = dataset.denormalize_c(c_pred)
-    c_true_phys = dataset.denormalize_c(c_true)
-    t_phys = dataset.denormalize_t(t_eval)
-
     results = {
         "t": t_eval.detach().cpu(),
-        "t_phys": t_phys.detach().cpu(),
+        "t_phys": t_eval.detach().cpu(),
         "c_pred": c_pred.detach().cpu(),
-        "c_pred_phys": c_pred_phys.detach().cpu(),
+        "c_pred_phys": c_pred.detach().cpu(),
     }
 
     # --- metrics ---
@@ -972,7 +965,7 @@ def predict_test(
         mse_coeff = torch.mean((c_pred - c_true) ** 2).item()
         results.update({
             "c_true": c_true.detach().cpu(),
-            "c_true_phys": c_true_phys.detach().cpu(),
+            "c_true_phys": c_true.detach().cpu(),
             "mse_coeff": mse_coeff,
         })
 
@@ -980,11 +973,10 @@ def predict_test(
 
     # --- hybrid extras ---
     if is_hybrid:
-        c_rom_phys = dataset.denormalize_c(c_rom)
         results.update({
-            "c_rom": c_rom_phys.detach().cpu(),
-            "c_residual": dataset.denormalize_c(r).detach().cpu(),
-            "c_hybrid": c_pred_phys.detach().cpu(),
+            "c_rom": c_rom.detach().cpu(),
+            "c_residual": r.detach().cpu(),
+            "c_hybrid": c_pred.detach().cpu(),
         })
 
         if compare_ground_truth:
@@ -1006,11 +998,11 @@ def predict_test(
     if reconstruct:
         try:
             x_grid = dataset.get_reconstruction_grid()
-            u_pred = dataset.reconstruct_u(c_pred, denormalize=True)
+            u_pred = dataset.reconstruct_u(c_pred, )
             results["u_pred"] = u_pred.detach().cpu()
 
             if compare_ground_truth:
-                u_true = dataset.reconstruct_u(c_true, denormalize=True)
+                u_true = dataset.reconstruct_u(c_true, )
                 results["u_true"] = u_true.detach().cpu()
                 mse_spatial = torch.mean((u_pred - u_true) ** 2).item()
                 results["mse_spatial"] = mse_spatial
@@ -1041,8 +1033,7 @@ def predict_and_comparison_plot(
     device = ds.c.device
 
     t_phys = torch.tensor(t_vals, device=device, dtype=ds.t.dtype)
-    t_stored = _to_stored_time(ds, t_phys)
-    t_stored, _ = torch.sort(t_stored)
+    t_phys, _ = torch.sort(t_phys)
 
     c0_stored = project_u0_to_c0_stored(ds, u0_callable)
 
@@ -1050,7 +1041,7 @@ def predict_and_comparison_plot(
 
     if is_hybrid:
         c_rom_tr, c_residual_tr, c_pred_tr = func.predict(
-            c0_train, t_stored,
+            c0_train, t_phys,
             method=method, rtol=rtol, atol=atol, options=ode_options,
             return_components=True,
         )
@@ -1063,12 +1054,12 @@ def predict_and_comparison_plot(
             c_pred_stored = c_pred_tr
 
     else:
-        c_pred_stored = rollout(func, t_stored, c0_train, method, rtol, atol, ode_options)
+        c_pred_stored = rollout(func, t_phys, c0_train, method, rtol, atol, ode_options)
         if transform is not None:
             c_pred_stored = transform.decode(c_pred_stored)
 
     # Reconstruct in physical space
-    U_pred_tx = ds.reconstruct_u(c_pred_stored, denormalize=True)
+    U_pred_tx = ds.reconstruct_u(c_pred_stored, )
     U_pred_tx_np = U_pred_tx.detach().cpu().numpy()
 
     x_grid = ds.get_reconstruction_grid()
@@ -1079,7 +1070,7 @@ def predict_and_comparison_plot(
     title_pred = "u_pred (Hybrid)" if is_hybrid else "u_pred (Neural ODE)"
 
     if is_hybrid:
-        U_rom_tx = ds.reconstruct_u(c_rom, denormalize=True)
+        U_rom_tx = ds.reconstruct_u(c_rom, )
         U_rom_tz = _u_to_numpy_on_zgrid(U_rom_tx.detach().cpu().numpy(), x_grid, np.asarray(z_vals, float))
         plot_sim_result(z_vals, t_vals, U_rom_tz, "u_ROM", notebook_plot=notebook_plot)
     plot_sim_result(z_vals, t_vals, U_pred_tz, title_pred, notebook_plot=notebook_plot)

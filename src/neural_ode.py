@@ -175,12 +175,6 @@ def trapz_weights_1d(x: np.ndarray) -> np.ndarray:
     return w
 
 
-def _to_stored_time(ds, t_phys: torch.Tensor) -> torch.Tensor:
-    """Convert physical time to stored time (with normalization if applicable)."""
-    if ds.config.normalize_t:
-        return (t_phys - ds.t_mean) / ds.t_std
-    return t_phys
-
 
 def _u_to_numpy_on_zgrid(U_tnx: np.ndarray, x_grid: np.ndarray, z_vals: np.ndarray) -> np.ndarray:
     """Interpolate spatial solution onto z_vals grid."""
@@ -318,11 +312,4 @@ def project_u0_to_c0_stored(ds, u0_callable) -> torch.Tensor:
         Phi_z = Phi_z_original
     
     P = (w.unsqueeze(0) * Phi_z).t().contiguous()
-    c0_phys = P.t() @ u0
-    
-    if ds.config.normalize_c:
-        mean = torch.as_tensor(ds.c_mean, device=device, dtype=dtype).squeeze(0)
-        std = torch.as_tensor(ds.c_std, device=device, dtype=dtype).squeeze(0)
-        return (c0_phys - mean) / std
-    
-    return c0_phys
+    return P.t() @ u0

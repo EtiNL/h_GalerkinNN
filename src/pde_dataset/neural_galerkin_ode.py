@@ -71,8 +71,6 @@ class NeuralGalerkinDatasetConfig:
     n_time_samples: int
     t_sampling: str
     seed: Optional[int]
-    normalize_t: bool
-    normalize_c: bool
     return_k_coords: bool
     pde_name: str
 
@@ -110,16 +108,9 @@ class NeuralGalerkinDataset(Dataset):
 
         self.M, self.nT, self.K = c.shape
 
-        # global normalizer stats (across all ICs and times)
-        self.t_mean = float(t.mean())
-        self.t_std = float(t.std() + 1e-8)
+        # Stats (used by whitening in training, not for dataset-level normalization)
         self.c_mean = c.reshape(-1, self.K).mean(axis=0, keepdims=True)       # (1,K)
         self.c_std  = c.reshape(-1, self.K).std(axis=0, keepdims=True) + 1e-8 # (1,K)
-
-        if config.normalize_t:
-            t = (t - self.t_mean) / self.t_std
-        if config.normalize_c:
-            c = (c - self.c_mean) / self.c_std
 
         self.t = torch.tensor(t, device=device, dtype=torch.float64)
         self.c = torch.tensor(c, device=device, dtype=dtype)
@@ -162,29 +153,14 @@ class NeuralGalerkinDataset(Dataset):
         """(t: (M,nT), c: (M,nT,K))"""
         return self.t, self.c
 
-    def denormalize_c(self, c: torch.Tensor) -> torch.Tensor:
-        """c is (...,K) in stored space -> physical coeffs."""
-        if not self.config.normalize_c:
-            return c
-        mean = torch.as_tensor(self.c_mean, device=c.device, dtype=c.dtype)  # (1,K)
-        std  = torch.as_tensor(self.c_std,  device=c.device, dtype=c.dtype)  # (1,K)
-        return c * std + mean
-
-    def denormalize_t(self, t: torch.Tensor) -> torch.Tensor:
-        if not self.config.normalize_t:
-            return t
-        return t * self.t_std + self.t_mean
-    
-    def reconstruct_u(self, c_traj: torch.Tensor, denormalize: bool = True) -> torch.Tensor:
+    def reconstruct_u(self, c_traj: torch.Tensor) -> torch.Tensor:
         """
         c_traj: (nT,K) or (K,)
         returns: (nT,nx) or (nx,)
         """
         if self.Phi is None:
             raise ValueError("No basis_matrix stored in dataset (Phi is None).")
-        if denormalize:
-            c_traj = self.denormalize_c(c_traj)
-        return c_traj.to(self.Phi.device, self.Phi.dtype) @ self.Phi  # matmul works for 1D/2D
+        return c_traj.to(self.Phi.device, self.Phi.dtype) @ self.Phi
 
     def get_reconstruction_grid(self) -> np.ndarray:
         if self.x_grid is None:
@@ -192,15 +168,11 @@ class NeuralGalerkinDataset(Dataset):
         return self.x_grid
 
     def save(self, filepath: str, format: str = "npz") -> None:
-        """
-        Save in *physical* space (i.e. unnormalized t,c), and store normalizer stats in metadata.
-        This makes reload + (re)normalization consistent and avoids double-normalizing.
-        """
-        # --- physical payload ---
-        t_phys = self.denormalize_t(self.t).detach().cpu().numpy()    # (M,nT)
-        c_phys = self.denormalize_c(self.c).detach().cpu().numpy()    # (M,nT,K)
-
-        data = {"t": t_phys, "c": c_phys}
+        """Save dataset to file."""
+        data = {
+            "t": self.t.detach().cpu().numpy(),
+            "c": self.c.detach().cpu().numpy(),
+        }
 
         if self.k_coords is not None:
             data["k"] = self.k_coords.detach().cpu().numpy()
@@ -232,10 +204,6 @@ class NeuralGalerkinDataset(Dataset):
             n_samples=int(self.M),  # number of trajectories / ICs
             bounds=bounds,
             normalizer={
-                "normalize_t": bool(self.config.normalize_t),
-                "normalize_c": bool(self.config.normalize_c),
-                "t_mean": float(self.t_mean),
-                "t_std": float(self.t_std),
                 "c_mean": self.c_mean.squeeze(0).tolist(),
                 "c_std": self.c_std.squeeze(0).tolist(),
             },
@@ -293,8 +261,6 @@ class NeuralGalerkinDataset(Dataset):
             n_time_samples=int(extra.get("n_time_samples", t.shape[1])),
             t_sampling=str(extra.get("t_sampling", "unknown")),
             seed=extra.get("seed", None),
-            normalize_t=bool(norm.get("normalize_t", False)),
-            normalize_c=bool(norm.get("normalize_c", False)),
             return_k_coords=bool(extra.get("return_k_coords", False)),
             pde_name=str(metadata.pde_name),
         )
@@ -309,9 +275,7 @@ class NeuralGalerkinDataset(Dataset):
             basis_matrix=Phi,
         )
 
-        # restore exact stats (important for exact denormalize)
-        if "t_mean" in norm: ds.t_mean = float(norm["t_mean"])
-        if "t_std"  in norm: ds.t_std  = float(norm["t_std"])
+        # restore stats (used by whitening in training)
         if "c_mean" in norm: ds.c_mean = np.asarray(norm["c_mean"], dtype=float)[None, :]
         if "c_std"  in norm: ds.c_std  = np.asarray(norm["c_std"], dtype=float)[None, :]
 
@@ -346,8 +310,6 @@ def create_NeuralGalerkin_dataset(
     weights: Optional[np.ndarray] = None,
     device: str = "cpu",
     dtype: torch.dtype = torch.float32,
-    normalize_t: bool = False,
-    normalize_c: bool = False,
     return_k_coords: bool = False,
     pde_name: str = "unknown",
 ) -> NeuralGalerkinDataset:
@@ -391,8 +353,6 @@ def create_NeuralGalerkin_dataset(
         n_time_samples=n_time_samples,
         t_sampling=t_sampling,
         seed=seed,
-        normalize_t=normalize_t,
-        normalize_c=normalize_c,
         return_k_coords=return_k_coords,
         pde_name=pde_name,
     )

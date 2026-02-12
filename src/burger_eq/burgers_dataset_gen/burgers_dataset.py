@@ -545,8 +545,6 @@ def create_burgers_NeuralGalerkin_dataset(
     t_sampling: str = "grid",
     device: str = "cpu",
     dtype: Any = None,
-    normalize_t: bool = False,
-    normalize_c: bool = False,
     return_k_coords: bool = False,
     seed: int = 42,
     precomputed_solutions: Optional[List[BurgersSolution]] = None,
@@ -621,8 +619,6 @@ def create_burgers_NeuralGalerkin_dataset(
         weights=None,
         device=device,
         dtype=dtype,
-        normalize_t=normalize_t,
-        normalize_c=normalize_c,
         return_k_coords=return_k_coords,
         pde_name="burgers",
     )
@@ -700,7 +696,7 @@ def generate_all_burgers_datasets(
     )
 
     print("Creating NeuralGalerkin dataset...")
-    ng_kwargs = {k: v for k, v in kwargs.items() if k in ['n_basis','n_time_samples','t_sampling','normalize_t','normalize_c','seed']}
+    ng_kwargs = {k: v for k, v in kwargs.items() if k in ['n_basis','n_time_samples','t_sampling','seed']}
     neural_galerkin_dataset = create_burgers_NeuralGalerkin_dataset(
         initial_conditions=[initial_condition],  # or a list
         hz=hz, Tmax=Tmax,

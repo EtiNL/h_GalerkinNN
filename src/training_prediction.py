@@ -133,26 +133,37 @@ def _make_lr_scheduler(optimizer, lr_scheduler_cfg, epochs):
 # Loss Functions
 # =====================================================================
 
-def _mse_ode_batch(func, t, cB, method, rtol, atol, ode_options, use_adjoint=True):
+def _mse_ode_batch(func, t, cB, method, rtol, atol, ode_options, use_adjoint=True,
+                   shooting_window=None):
     """Compute MSE loss for a batch.
 
     Args:
         use_adjoint: If True, use adjoint method for O(1) memory backprop.
-                     This is essential for training to avoid OOM errors.
+        shooting_window: If set, use multiple-shooting with this many time steps
+                        per window. Picks a random window each call. None = full trajectory.
     """
-    y0 = cB[:, 0, :]
+    nT = t.shape[0]
+
+    # Multiple shooting: pick a random sub-window of the trajectory
+    if shooting_window is not None and shooting_window < nT:
+        start = torch.randint(0, nT - shooting_window, (1,)).item()
+        t_win = t[start : start + shooting_window]
+        cB_win = cB[:, start : start + shooting_window, :]
+    else:
+        t_win = t
+        cB_win = cB
+
+    y0 = cB_win[:, 0, :]
     if use_adjoint:
-        # Adjoint method: O(1) memory w.r.t. number of solver steps
         pred_tBK = odeint_adjoint(
-            func, y0, t,
+            func, y0, t_win,
             method=method, rtol=rtol, atol=atol, options=ode_options,
-            adjoint_params=tuple(func.parameters())  # explicitly specify to avoid graph retention
+            adjoint_params=tuple(func.parameters())
         )
     else:
-        # Standard method: stores all intermediate states (memory hungry)
-        pred_tBK = odeint_fwd(func, y0, t, method=method, rtol=rtol, atol=atol, options=ode_options)
+        pred_tBK = odeint_fwd(func, y0, t_win, method=method, rtol=rtol, atol=atol, options=ode_options)
     pred_BtK = pred_tBK.permute(1, 0, 2).contiguous()
-    return torch.mean((pred_BtK - cB) ** 2)
+    return torch.mean((pred_BtK - cB_win) ** 2)
 
 
 @torch.no_grad()
@@ -241,9 +252,6 @@ def train_neural_ode_on_neural_galerkin_dataset(
     split_seed: int = 0,
     epochs: int = 2000,
     weight_decay: float = 1e-5,
-    hidden: int = 256,
-    num_layers: int = 1,
-    time_dependent: bool = True,
     method: str = "dopri5",
     rtol: float = 1e-6,
     atol: float = 1e-6,
@@ -260,9 +268,19 @@ def train_neural_ode_on_neural_galerkin_dataset(
     early_stopping_patience: int = 20,
     early_stopping_min_delta: float = 1e-7,
     use_adjoint=True,
+    shooting_start: int | None = None,
+    shooting_grow_epochs: int = 0,
 ):
     """
     Train pure Neural ODE on dataset.
+
+    Args:
+        shooting_start: Initial shooting window size (number of time steps).
+            If None, integrate over the full trajectory from the start.
+            Smaller windows give stronger gradients and faster epochs.
+        shooting_grow_epochs: Over how many epochs to linearly grow the
+            shooting window from shooting_start to the full trajectory length.
+            0 means use shooting_start for the entire training.
 
     Returns:
         func: Trained Neural ODE
@@ -324,7 +342,19 @@ def train_neural_ode_on_neural_galerkin_dataset(
     patience_counter = 0
     best_state = None
 
+    nT_full = t_shared.numel()
+
     for ep in tqdm(range(1, epochs + 1), desc="Training Neural ODE"):
+        # Compute current shooting window (curriculum: start short, grow to full)
+        if shooting_start is not None and shooting_start < nT_full:
+            if shooting_grow_epochs > 0:
+                frac = min(1.0, ep / shooting_grow_epochs)
+                cur_window = int(shooting_start + frac * (nT_full - shooting_start))
+            else:
+                cur_window = shooting_start
+        else:
+            cur_window = None  # full trajectory
+
         neural_ode_func.train()
         perm = torch.randperm(len(train_ids), device=device)
         train_ids_shuf = [train_ids[int(i)] for i in perm.tolist()]
@@ -336,7 +366,8 @@ def train_neural_ode_on_neural_galerkin_dataset(
             cB = C_train_space[b_ids]
 
             opt.zero_grad(set_to_none=True)
-            loss = _mse_ode_batch(neural_ode_func, t_shared, cB, method, rtol, atol, ode_options, use_adjoint=use_adjoint)
+            loss = _mse_ode_batch(neural_ode_func, t_shared, cB, method, rtol, atol, ode_options,
+                                  use_adjoint=use_adjoint, shooting_window=cur_window)
             loss.backward()
 
             if grad_clip is not None:
@@ -374,10 +405,10 @@ def train_neural_ode_on_neural_galerkin_dataset(
                 best_state = {k: v.cpu().clone() for k, v in neural_ode_func.state_dict().items()}
                 print(f"  ✓ New best model!")
             else:
-                patience_counter += print_every
+                patience_counter += 1
 
             if patience_counter >= early_stopping_patience:
-                print(f"\nEarly stopping at epoch {ep}")
+                print(f"\nEarly stopping at epoch {ep} (no improvement for {patience_counter * print_every} epochs)")
                 break
 
     # Restore best model
@@ -782,10 +813,10 @@ def train_hybrid_rom_neural_ode(
                 best_state = {k: v.cpu().clone() for k, v in hybrid_model.neural_ode.state_dict().items()}
                 print("  ✓ New best model!")
             else:
-                patience_counter += print_every
+                patience_counter += 1
 
             if patience_counter >= early_stopping_patience:
-                print(f"\nEarly stopping at epoch {ep}")
+                print(f"\nEarly stopping at epoch {ep} (no improvement for {patience_counter * print_every} epochs)")
                 break
 
     # Restore best NN

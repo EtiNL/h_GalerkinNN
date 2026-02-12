@@ -27,7 +27,7 @@ class CoeffODEFunc(nn.Module):
     """
 
     def __init__(self, K: int, hidden: int = 256, time_dependent: bool = True,
-                 num_layers: int = 1, activation: str = "silu"):
+                 num_layers: int = 1, activation: str = "tanh"):
         super().__init__()
         self.time_dependent = time_dependent
         inp = K + (1 if time_dependent else 0)

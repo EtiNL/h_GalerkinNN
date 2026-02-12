@@ -126,7 +126,7 @@ class hCoeffODEFunc(nn.Module):
 
     def __init__(self, K: int, Gd, P, nu, hidden: int = 256, num_layers: int = 1):
         super().__init__()
-        self.net = HomogeneousNN(K, hidden, K, P=P, Gd=Gd, nu=nu, hidden_layers=num_layers, is_field=True)
+        self.net = HomogeneousNN(K, hidden, P=P, Gd=Gd, nu=nu, hidden_layers=num_layers, is_field=True)
 
         for m in self.net.modules():
             if isinstance(m, nn.Linear):

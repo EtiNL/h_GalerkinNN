@@ -856,6 +856,44 @@ def train_hybrid_rom_neural_ode(
 # =====================================================================
 
 @torch.no_grad()
+def predict_neural_ode(
+    func, ds, u0_callable, t_vals, z_vals,
+    method="dopri5", rtol=1e-6, atol=1e-6, ode_options=None,
+    transform=None,
+):
+    """
+    Project u0 → coefficients, integrate Neural ODE, reconstruct on z_vals grid.
+
+    Args:
+        func: trained Neural ODE (CoeffODEFunc or hCoeffODEFunc)
+        ds: NeuralGalerkinDataset
+        u0_callable: initial condition function u0(z) -> float
+        t_vals: 1D numpy array of physical times
+        z_vals: 1D numpy array of spatial grid points
+        transform: AffineCoeffTransform (whitening), or None
+
+    Returns:
+        U_pred: numpy array (len(t_vals), len(z_vals))
+    """
+    device = ds.c.device
+
+    t_phys = torch.tensor(t_vals, device=device, dtype=ds.t.dtype)
+    t_stored = _to_stored_time(ds, t_phys)
+    t_stored, _ = torch.sort(t_stored)
+
+    c0_stored = project_u0_to_c0_stored(ds, u0_callable)
+    c0_train = transform.encode(c0_stored) if transform is not None else c0_stored
+
+    c_pred = rollout(func, t_stored, c0_train, method, rtol, atol, ode_options)
+    if transform is not None:
+        c_pred = transform.decode(c_pred)
+
+    U_pred_tx = ds.reconstruct_u(c_pred, denormalize=True).detach().cpu().numpy()
+    x_grid = ds.get_reconstruction_grid()
+    return _u_to_numpy_on_zgrid(U_pred_tx, x_grid, np.asarray(z_vals, float))
+
+
+@torch.no_grad()
 def predict_test(
     func,
     dataset,

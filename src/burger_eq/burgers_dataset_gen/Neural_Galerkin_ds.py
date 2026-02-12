@@ -156,21 +156,29 @@ def burgers_neural_ds(
     normalize_c: bool = False,
     dtype: torch.dtype = torch.float32,
     orthonormalize: bool = True,
+    hermite_scale: float | None = None,
+    hermite_shift: float | None = None,
 ):
     """
     Generate Neural Galerkin dataset for Burgers equation with orthonormalized basis.
-    
+
     Key: Orthonormalization is applied only to the z-grid projection basis.
     For x0 reconstruction on arbitrary grids, we use the continuous Hermite basis.
+
+    Args:
+        hermite_scale: Override basis scale. Default (None) computes from z_range.
+            Use 1.0 to match the standard Hermite basis (no rescaling).
+        hermite_shift: Override basis shift. Default (None) computes from z_range.
+            Use 0.0 to match the standard Hermite basis (no shifting).
     """
     device = solver.device
-    
+
     # Spatial grid
     z = torch.arange(z_range[0], z_range[1] + 0.5 * hz, hz, device=device, dtype=dtype)
-    
+
     # Hermite basis parameters
-    shift = 0.5 * (z_range[0] + z_range[1])
-    scale = (z_range[1] - z_range[0]) / 6.0
+    shift = hermite_shift if hermite_shift is not None else 0.5 * (z_range[0] + z_range[1])
+    scale = hermite_scale if hermite_scale is not None else (z_range[1] - z_range[0]) / 6.0
     
     # Build basis on z-grid
     Phi_z_original = hermite_basis_x_torch(z, K, scale=scale, shift=shift)  # (K, nz)

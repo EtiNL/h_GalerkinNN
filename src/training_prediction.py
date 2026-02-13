@@ -167,6 +167,8 @@ def _mse_ode_batch(func, t, cB, method, rtol, atol, ode_options, use_adjoint=Tru
             pred_tBK = odeint_fwd(func, y0, t_win, method=method, rtol=rtol, atol=atol, options=ode_options)
     except (AssertionError, RuntimeError):
         return None
+    if not torch.isfinite(pred_tBK).all():
+        return None
     pred_BtK = pred_tBK.permute(1, 0, 2).contiguous()
     return torch.mean((pred_BtK - cB_win) ** 2)
 
@@ -350,10 +352,15 @@ def train_neural_ode_on_neural_galerkin_dataset(
     best_state = None
 
     nT_full = t_shared.numel()
+    stiff_fail_threshold = 0.5  # if >50% batches fail, reduce shooting window
+    stiff_window_reduction = 0.7  # shrink window to 70% on stiffness event
+    stiff_window_override = None  # adaptive override of shooting window
 
     for ep in tqdm(range(1, epochs + 1), desc="Training Neural ODE"):
         # Compute current shooting window (curriculum: start short, grow to full)
-        if shooting_start is not None and shooting_start < nT_full:
+        if stiff_window_override is not None:
+            cur_window = stiff_window_override
+        elif shooting_start is not None and shooting_start < nT_full:
             if shooting_grow_epochs > 0:
                 frac = min(1.0, ep / shooting_grow_epochs)
                 cur_window = int(shooting_start + frac * (nT_full - shooting_start))
@@ -368,6 +375,8 @@ def train_neural_ode_on_neural_galerkin_dataset(
 
         tot = 0.0
         n = 0
+        n_batches = 0
+        n_failed = 0
         for s in range(0, len(train_ids_shuf), batch_ics):
             b_ids = train_ids_shuf[s : s + batch_ics]
             cB = C_train_space[b_ids]
@@ -375,7 +384,9 @@ def train_neural_ode_on_neural_galerkin_dataset(
             opt.zero_grad(set_to_none=True)
             loss = _mse_ode_batch(neural_ode_field, t_shared, cB, method, rtol, atol, ode_options,
                                   use_adjoint=use_adjoint, shooting_window=cur_window)
+            n_batches += 1
             if loss is None:
+                n_failed += 1
                 continue  # solver failed (dt underflow), skip batch
             loss.backward()
 
@@ -389,6 +400,29 @@ def train_neural_ode_on_neural_galerkin_dataset(
 
         train_mse = tot / max(1, n)
         train_curve.append(train_mse)
+
+        # --- Stiffness detection and adaptive window reduction ---
+        fail_rate = n_failed / max(1, n_batches)
+        if fail_rate > stiff_fail_threshold:
+            effective_window = cur_window if cur_window is not None else nT_full
+            new_window = max(shooting_start or 10, int(effective_window * stiff_window_reduction))
+            if stiff_window_override is None or new_window < stiff_window_override:
+                stiff_window_override = new_window
+            print(f"\n  ⚠ STIFFNESS: {n_failed}/{n_batches} batches failed ({fail_rate:.0%}) "
+                  f"| shooting window reduced: {effective_window} → {stiff_window_override}")
+        elif stiff_window_override is not None and fail_rate < 0.1:
+            # Recovery: gradually grow window back toward the curriculum target
+            if shooting_start is not None and shooting_start < nT_full and shooting_grow_epochs > 0:
+                frac = min(1.0, ep / shooting_grow_epochs)
+                target_window = int(shooting_start + frac * (nT_full - shooting_start))
+            else:
+                target_window = nT_full
+            recovered_window = min(target_window, int(stiff_window_override * 1.1))
+            if recovered_window >= target_window:
+                stiff_window_override = None  # fully recovered, resume normal curriculum
+                print(f"\n  ✓ Stiffness recovered: resumed normal curriculum (window={target_window})")
+            else:
+                stiff_window_override = recovered_window
 
         if scheduler is not None and step_on == "epoch":
             scheduler.step()
@@ -404,8 +438,11 @@ def train_neural_ode_on_neural_galerkin_dataset(
                 scheduler.step(val_mse)
 
             current_lr = opt.param_groups[0]['lr']
+            window_str = f", Window: {cur_window}" if cur_window is not None else ""
+            stiff_str = f", Failed: {n_failed}/{n_batches}" if n_failed > 0 else ""
             print(f"Epoch {ep:4d} | Train: {train_mse:.6e}, Val: {val_mse:.6e} | "
-                  f"LR: {current_lr:.6e}, Patience: {patience_counter}/{early_stopping_patience}")
+                  f"LR: {current_lr:.6e}, Patience: {patience_counter}/{early_stopping_patience}"
+                  f"{window_str}{stiff_str}")
 
             if val_mse < best_val_loss - early_stopping_min_delta:
                 best_val_loss = val_mse

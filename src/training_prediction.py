@@ -140,6 +140,9 @@ def _mse_ode_batch(func, t, cB, method, rtol, atol, ode_options, use_adjoint=Tru
         use_adjoint: If True, use adjoint method for O(1) memory backprop.
         shooting_window: If set, use multiple-shooting with this many time steps
                         per window. Picks a random window each call. None = full trajectory.
+
+    Returns:
+        loss tensor, or None if the solver failed (dt underflow / non-finite state).
     """
     nT = t.shape[0]
 
@@ -153,14 +156,17 @@ def _mse_ode_batch(func, t, cB, method, rtol, atol, ode_options, use_adjoint=Tru
         cB_win = cB
 
     y0 = cB_win[:, 0, :]
-    if use_adjoint:
-        pred_tBK = odeint_adjoint(
-            func, y0, t_win,
-            method=method, rtol=rtol, atol=atol, options=ode_options,
-            adjoint_params=tuple(func.parameters())
-        )
-    else:
-        pred_tBK = odeint_fwd(func, y0, t_win, method=method, rtol=rtol, atol=atol, options=ode_options)
+    try:
+        if use_adjoint:
+            pred_tBK = odeint_adjoint(
+                func, y0, t_win,
+                method=method, rtol=rtol, atol=atol, options=ode_options,
+                adjoint_params=tuple(func.parameters())
+            )
+        else:
+            pred_tBK = odeint_fwd(func, y0, t_win, method=method, rtol=rtol, atol=atol, options=ode_options)
+    except (AssertionError, RuntimeError):
+        return None
     pred_BtK = pred_tBK.permute(1, 0, 2).contiguous()
     return torch.mean((pred_BtK - cB_win) ** 2)
 
@@ -175,9 +181,11 @@ def eval_mse_ode(func, t, C, ids, batch_ics, method, rtol, atol, ode_options):
         b_ids = ids[s : s + batch_ics]
         cB = C[b_ids]
         loss = _mse_ode_batch(func, t, cB, method, rtol, atol, ode_options)
+        if loss is None:
+            continue
         tot += float(loss.item()) * len(b_ids)
         n += len(b_ids)
-    return tot / max(1, n)
+    return tot / max(1, n) if n > 0 else float("inf")
 
 
 # =====================================================================
@@ -367,6 +375,8 @@ def train_neural_ode_on_neural_galerkin_dataset(
             opt.zero_grad(set_to_none=True)
             loss = _mse_ode_batch(neural_ode_field, t_shared, cB, method, rtol, atol, ode_options,
                                   use_adjoint=use_adjoint, shooting_window=cur_window)
+            if loss is None:
+                continue  # solver failed (dt underflow), skip batch
             loss.backward()
 
             if grad_clip is not None:

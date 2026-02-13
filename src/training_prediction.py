@@ -308,13 +308,13 @@ def train_neural_ode_on_neural_galerkin_dataset(
     print(f"\n{'='*60}")
     print("NEURAL ODE TRAINING")
     print(f"{'='*60}")
-    print(f"Parameters: {sum(p.numel() for p in neural_ode_func.parameters()):,}")
+    print(f"Parameters: {sum(p.numel() for p in neural_ode_field.parameters()):,}")
     print(f"Train ICs: {len(train_ids)}, Val ICs: {len(val_ids)}")
 
     # Derivative pretraining
     if pretrain_derivative and pretrain_epochs > 0:
-        neural_ode_func = pretrain_rhs_derivative_matching(
-            neural_ode_func,
+        neural_ode_field = pretrain_rhs_derivative_matching(
+            neural_ode_field,
             t=t_shared,
             C=C_train_space,
             train_ids=train_ids,
@@ -326,7 +326,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
 
     # Optimizer - use lr from scheduler config if provided
     init_lr = lr_scheduler.get("lr", 1e-3) if lr_scheduler else 1e-3
-    opt = torch.optim.Adam(neural_ode_func.parameters(), lr=init_lr, weight_decay=weight_decay)
+    opt = torch.optim.Adam(neural_ode_field.parameters(), lr=init_lr, weight_decay=weight_decay)
     print(f"Initial LR: {init_lr:.6e}, Weight decay: {weight_decay:.6e}")
 
     # LR scheduler
@@ -354,7 +354,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
         else:
             cur_window = None  # full trajectory
 
-        neural_ode_func.train()
+        neural_ode_field.train()
         perm = torch.randperm(len(train_ids), device=device)
         train_ids_shuf = [train_ids[int(i)] for i in perm.tolist()]
 
@@ -365,12 +365,12 @@ def train_neural_ode_on_neural_galerkin_dataset(
             cB = C_train_space[b_ids]
 
             opt.zero_grad(set_to_none=True)
-            loss = _mse_ode_batch(neural_ode_func, t_shared, cB, method, rtol, atol, ode_options,
+            loss = _mse_ode_batch(neural_ode_field, t_shared, cB, method, rtol, atol, ode_options,
                                   use_adjoint=use_adjoint, shooting_window=cur_window)
             loss.backward()
 
             if grad_clip is not None:
-                nn.utils.clip_grad_norm_(neural_ode_func.parameters(), grad_clip)
+                nn.utils.clip_grad_norm_(neural_ode_field.parameters(), grad_clip)
 
             opt.step()
 
@@ -386,7 +386,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
         # Validation
         if len(val_ids) > 0 and (ep % print_every == 0 or ep == epochs):
             val_batch = min(64, batch_ics)
-            val_mse = eval_mse_ode(neural_ode_func, t_shared, C_train_space, val_ids, val_batch, method, rtol, atol, ode_options)
+            val_mse = eval_mse_ode(neural_ode_field, t_shared, C_train_space, val_ids, val_batch, method, rtol, atol, ode_options)
             val_curve.append(val_mse)
             val_epochs.append(ep)
 
@@ -401,7 +401,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
                 best_val_loss = val_mse
                 best_epoch = ep
                 patience_counter = 0
-                best_state = {k: v.cpu().clone() for k, v in neural_ode_func.state_dict().items()}
+                best_state = {k: v.cpu().clone() for k, v in neural_ode_field.state_dict().items()}
                 print(f"  ✓ New best model!")
             else:
                 patience_counter += 1
@@ -412,7 +412,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
 
     # Restore best model
     if best_state is not None:
-        neural_ode_func.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+        neural_ode_field.load_state_dict({k: v.to(device) for k, v in best_state.items()})
         print(f"\n✓ Restored best model from epoch {best_epoch}")
 
     # Plot
@@ -431,7 +431,7 @@ def train_neural_ode_on_neural_galerkin_dataset(
         "final_train_loss": train_curve[best_epoch-1] if best_epoch > 0 else train_curve[-1],
     }
 
-    return neural_ode_func, info
+    return neural_ode_field, info
 
 # =====================================================================
 # Training: Hybrid ROM + Neural ODE
@@ -882,7 +882,7 @@ def predict_neural_ode(
     c0_stored = project_u0_to_c0_stored(ds, u0_callable)
     c0_train = transform.encode(c0_stored) if transform is not None else c0_stored
 
-    c_pred = rollout(func, t_phys, c0_train, method, rtol, atol, ode_options)
+    c_pred = rollout(field, t_phys, c0_train, method, rtol, atol, ode_options)
     if transform is not None:
         c_pred = transform.decode(c_pred)
 
@@ -907,7 +907,7 @@ def predict_test(
     transform=None,
     is_hybrid: bool = False,
 ):
-    func.eval()
+    field.eval()
     device = dataset.c.device
 
     # --- time + ground truth ---
@@ -927,7 +927,7 @@ def predict_test(
 
     # --- rollout ---
     if is_hybrid:
-        c_rom_tr, r_tr, c_pred_tr = func.predict(
+        c_rom_tr, r_tr, c_pred_tr = field.predict(
             c0_train,
             t_eval,
             method=method,
@@ -938,7 +938,7 @@ def predict_test(
         )
     else:
         c_pred_tr = rollout(
-            func, t_eval, c0_train,
+            field, t_eval, c0_train,
             method=method, rtol=rtol, atol=atol, options=ode_options
         )
 

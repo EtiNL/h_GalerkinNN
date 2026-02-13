@@ -183,10 +183,6 @@ class NeuralGalerkinDataset(Dataset):
         if self.Phi is not None:
             data["Phi"] = self.Phi.detach().cpu().numpy()            # (K,nx)
 
-        # Save basis parameters
-        if hasattr(self, 'transformation_matrix') and self.transformation_matrix is not None:
-            data["transformation_matrix"] = np.asarray(self.transformation_matrix, dtype=float)
-
         # --- bounds (optional, but useful) ---
         bounds = {
             "t_min": float(t_phys.min()),
@@ -220,7 +216,6 @@ class NeuralGalerkinDataset(Dataset):
                 # Save basis construction parameters
                 "hermite_scale": float(self.hermite_scale) if hasattr(self, 'hermite_scale') else None,
                 "hermite_shift": float(self.hermite_shift) if hasattr(self, 'hermite_shift') else None,
-                "orthonormalize": bool(self.orthonormalize) if hasattr(self, 'orthonormalize') else False,
             },
         )
 
@@ -252,7 +247,6 @@ class NeuralGalerkinDataset(Dataset):
         c = to_np("c")              # (M,nT,K) physical
         x_grid = to_np("x_grid")    # (nx,) or None
         Phi = to_np("Phi")          # (K,nx) or None
-        T_matrix = to_np("transformation_matrix")  # ✅ Load transformation matrix
 
         extra = metadata.extra_info or {}
         norm = metadata.normalizer or {}
@@ -284,13 +278,6 @@ class NeuralGalerkinDataset(Dataset):
             ds.hermite_scale = float(extra["hermite_scale"])
         if "hermite_shift" in extra and extra["hermite_shift"] is not None:
             ds.hermite_shift = float(extra["hermite_shift"])
-        if "orthonormalize" in extra:
-            ds.orthonormalize = bool(extra["orthonormalize"])
-        
-        if T_matrix is not None:
-            ds.transformation_matrix = T_matrix
-        else:
-            ds.transformation_matrix = None
 
         return ds
 

@@ -301,15 +301,7 @@ def project_u0_to_c0_stored(ds, u0_callable) -> torch.Tensor:
     w = torch.tensor(w_np, device=device, dtype=dtype)
     
     x_torch = torch.tensor(x_grid, device=device, dtype=dtype)
-    Phi_z_original = hermite_basis_x_torch(x_torch, K, scale=ds.hermite_scale, shift=ds.hermite_shift)
-    
-    if hasattr(ds, 'orthonormalize') and ds.orthonormalize:
-        if ds.transformation_matrix is None:
-            raise ValueError("Dataset was orthonormalized but transformation_matrix is missing!")
-        T = torch.as_tensor(ds.transformation_matrix, device=device, dtype=dtype)
-        Phi_z = T @ Phi_z_original
-    else:
-        Phi_z = Phi_z_original
-    
+    Phi_z = hermite_basis_x_torch(x_torch, K, scale=ds.hermite_scale, shift=ds.hermite_shift)
+
     P = (w.unsqueeze(0) * Phi_z).t().contiguous()
     return P.t() @ u0

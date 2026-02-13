@@ -80,50 +80,6 @@ def hermite_basis_x_torch(x: torch.Tensor, K: int, scale: float, shift: float) -
 
 
 @torch.no_grad()
-def orthonormalize_discrete_basis(Phi: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """
-    Gram-Schmidt orthonormalization for discrete basis with quadrature weights.
-    
-    Ensures: ∫ φ_i φ_j w dz = δ_ij (Kronecker delta)
-    
-    Args:
-        Phi: (K, nz) - basis functions
-        w: (nz,) - quadrature weights
-    
-    Returns:
-        Phi_ortho: (K, nz) - orthonormalized basis
-    """
-    K, nz = Phi.shape
-    device = Phi.device
-    dtype = Phi.dtype
-    
-    # Work in float64 for stability
-    Phi_ortho = torch.zeros((K, nz), device=device, dtype=torch.float64)
-    Phi_64 = Phi.to(torch.float64)
-    w_64 = w.to(torch.float64)
-    
-    for k in range(K):
-        v = Phi_64[k].clone()
-        
-        # Subtract projections onto previous orthonormal vectors
-        for j in range(k):
-            # Inner product: <v, φ_j> = ∫ v(z) φ_j(z) w(z) dz
-            proj = torch.sum(w_64 * v * Phi_ortho[j])
-            v = v - proj * Phi_ortho[j]
-        
-        # Normalize: ||v|| = sqrt(∫ v(z)² w(z) dz)
-        norm_sq = torch.sum(w_64 * v * v)
-        if norm_sq < 1e-14:
-            print(f"⚠️  WARNING: Mode {k} has near-zero norm after orthogonalization!")
-            v = torch.zeros_like(v)
-            v[k] = 1.0  # Fallback to standard basis vector
-            norm_sq = torch.sum(w_64 * v * v)
-        
-        Phi_ortho[k] = v / torch.sqrt(norm_sq)
-    
-    return Phi_ortho.to(dtype)
-
-@torch.no_grad()
 def interp_time_batch(t_grid: torch.Tensor, C_grid: torch.Tensor, t_query: torch.Tensor) -> torch.Tensor:
     """Linear interpolation in time for coefficient trajectories."""
     tq = t_query.clamp(t_grid[0], t_grid[-1])
@@ -153,15 +109,11 @@ def burgers_neural_ds(
     t_sampling: str = "grid",
     seed: int = 0,
     dtype: torch.dtype = torch.float32,
-    orthonormalize: bool = True,
     hermite_scale: float | None = None,
     hermite_shift: float | None = None,
 ):
     """
-    Generate Neural Galerkin dataset for Burgers equation with orthonormalized basis.
-
-    Key: Orthonormalization is applied only to the z-grid projection basis.
-    For x0 reconstruction on arbitrary grids, we use the continuous Hermite basis.
+    Generate Neural Galerkin dataset for Burgers equation.
 
     Args:
         hermite_scale: Override basis scale. Default (None) computes from z_range.
@@ -179,30 +131,10 @@ def burgers_neural_ds(
     scale = hermite_scale if hermite_scale is not None else (z_range[1] - z_range[0]) / 6.0
     
     # Build basis on z-grid
-    Phi_z_original = hermite_basis_x_torch(z, K, scale=scale, shift=shift)  # (K, nz)
-    w_z = trapz_weights_1d_torch(z)                                          # (nz,)
-    
-    # Orthonormalize on z-grid for projection
-    if orthonormalize:
-        Phi_z = orthonormalize_discrete_basis(Phi_z_original, w_z)
-        
-        # Verify
-        Gram = Phi_z @ torch.diag(w_z) @ Phi_z.t()
-        diag_error = (torch.diag(Gram) - 1.0).abs().max()
-        offdiag_error = (Gram - torch.diag(torch.diag(Gram))).abs().max()
-        
-        if diag_error > 1e-6 or offdiag_error > 1e-6:
-            print(f"Orthonormalization quality check failed!")
-        
-        # Solve: T @ Phi_z_original = Phi_z for T
-        # T = Phi_z @ pinv(Phi_z_original)
-        T = Phi_z @ torch.linalg.pinv(Phi_z_original)
+    Phi_z = hermite_basis_x_torch(z, K, scale=scale, shift=shift)  # (K, nz)
+    w_z = trapz_weights_1d_torch(z)                                 # (nz,)
 
-    else:
-        Phi_z = Phi_z_original
-        T = torch.eye(K, device=device, dtype=dtype)
-    
-    # Projection matrix (uses orthonormalized basis)
+    # Projection matrix
     P = (w_z.unsqueeze(0) * Phi_z).t().contiguous()  # (nz, K)
     
     # Generate ICs on unit sphere
@@ -216,34 +148,20 @@ def burgers_neural_ds(
     else:
         Ccoeff = A
     
-    def make_x0_fn(c_ortho: torch.Tensor):
-        """
-        Returns a function that evaluates x0 at any point.
-        
-        When orthonormalized: uses transformed basis for perfect round-trip projection.
-        """
+    def make_x0_fn(c_coeff: torch.Tensor):
+        """Returns a function that evaluates x0 at any point."""
         def f(x):
             is_torch = isinstance(x, torch.Tensor)
             if not is_torch:
                 x = torch.tensor(x, device=device, dtype=dtype)
-            
-            # Evaluate continuous Hermite basis at x
-            Phi_x_original = hermite_basis_x_torch(x, K, scale=scale, shift=shift)  # (K, nx)
-            
-            if orthonormalize:
-                # Apply same transformation as on z-grid: Phi_ortho = T @ Phi_original
-                Phi_x_ortho = T @ Phi_x_original
-                u_x = c_ortho @ Phi_x_ortho  # Reconstruct with orthonormalized basis
-            else:
-                u_x = c_ortho @ Phi_x_original
-            
+            Phi_x = hermite_basis_x_torch(x, K, scale=scale, shift=shift)  # (K, nx)
+            u_x = c_coeff @ Phi_x
             return u_x if is_torch else u_x.detach().cpu().numpy()
-        
         return f
     
     x0_list = [make_x0_fn(Ccoeff[i]) for i in range(N)]
     
-    # Solve PDE (uses transformed coefficients via orthonormal projection)
+    # Solve PDE
     ht = hz ** 2
     z_vals, t_vals, C_grid = solver.solve_parallel_projected(
         x0_list=x0_list,
@@ -255,7 +173,7 @@ def burgers_neural_ds(
         L=L,
         n_quad_points=n_quad_points,
         q_n=q_n,
-        P=P,  # Uses orthonormalized basis
+        P=P,
         z_batch_size=z_batch_size,
         compute_G_if_missing=True,
         enforce_exact_ic=True,
@@ -310,9 +228,7 @@ def burgers_neural_ds(
     # Store basis parameters for projection of arbitrary ICs
     ds.hermite_scale = float(scale)
     ds.hermite_shift = float(shift)
-    ds.orthonormalize = bool(orthonormalize)
-    ds.transformation_matrix = T.detach().cpu().numpy() if orthonormalize else None
-    
+
     return ds
     
 

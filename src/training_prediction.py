@@ -245,7 +245,7 @@ def pretrain_rhs_derivative_matching(
 # =====================================================================
 
 def train_neural_ode_on_neural_galerkin_dataset(
-    neural_ode_func,
+    neural_ode_field,
     ds,
     val_frac: float = 0.25,
     split_seed: int = 0,
@@ -856,7 +856,7 @@ def train_hybrid_rom_neural_ode(
 
 @torch.no_grad()
 def predict_neural_ode(
-    func, ds, u0_callable, t_vals, z_vals,
+    field, ds, u0_callable, t_vals, z_vals,
     method="dopri5", rtol=1e-6, atol=1e-6, ode_options=None,
     transform=None,
 ):
@@ -893,7 +893,7 @@ def predict_neural_ode(
 
 @torch.no_grad()
 def predict_test(
-    func,
+    field,
     dataset,
     ic_idx=0,
     t_eval=None,

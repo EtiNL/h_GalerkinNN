@@ -1178,6 +1178,229 @@ def eval_hybrid_val_mse(
 
     return mse_sum / max(1, n)
 
+
+# =====================================================================
+# Dataset Evaluation (test-time metrics)
+# =====================================================================
+
+@torch.no_grad()
+def evaluate_on_dataset(
+    field,
+    dataset,
+    ic_ids,
+    t_shared=None,
+    C_all=None,
+    time_subsample=None,
+    method="dopri5",
+    rtol=1e-6,
+    atol=1e-6,
+    ode_options=None,
+    transform=None,
+    is_hybrid=False,
+    reconstruct=True,
+    batch_ics=64,
+    verbose=True,
+):
+    """
+    Evaluate model on a set of ICs using predict_test-style metrics.
+
+    Computes per-IC and aggregate:
+      - mse_coeff:   MSE in stored coefficient space
+      - rel_l2_coeff: relative L2 error in coefficient space
+      - mse_spatial: MSE in physical domain (if reconstruct=True)
+      - rel_l2_spatial: relative L2 error in physical domain
+      - For hybrid: ROM baseline metrics + improvement percentages
+
+    Args:
+        field: trained Neural ODE (CoeffODEFunc / hCoeffODEFunc)
+               or HybridROMNeuralODE
+        dataset: NeuralGalerkinDataset (for reconstruction)
+        ic_ids: list/array of IC indices to evaluate
+        t_shared: [nT] shared time grid.  If None, packed from dataset.
+        C_all: [M, nT, K] ground-truth coefficients (stored space).
+               If None, packed from dataset.
+        time_subsample: used only when packing from dataset
+        transform: AffineCoeffTransform (whitening, pure Neural ODE only)
+        is_hybrid: True for HybridROMNeuralODE
+        reconstruct: also compute spatial-domain metrics
+        batch_ics: evaluation batch size
+        verbose: print summary table
+
+    Returns:
+        dict with aggregate and per-IC metrics
+    """
+    # Pack data if not provided
+    if t_shared is None or C_all is None:
+        t_shared, C_all = pack_dataset_trajectories(
+            dataset, time_subsample=time_subsample, require_shared_time=True,
+        )
+
+    field.eval()
+    device = C_all.device
+    ids = list(ic_ids)
+
+    per_ic_mse_coeff = []
+    per_ic_rel_l2_coeff = []
+    per_ic_mse_spatial = []
+    per_ic_rel_l2_spatial = []
+    # hybrid extras
+    per_ic_mse_rom = []
+    per_ic_rel_l2_rom = []
+    per_ic_mse_rom_spatial = []
+    per_ic_rel_l2_rom_spatial = []
+
+    n_failed = 0
+
+    for s in range(0, len(ids), batch_ics):
+        b_ids = ids[s : s + batch_ics]
+        c_true = C_all[b_ids]           # [B, nT, K]  stored space
+        c0 = c_true[:, 0, :]            # [B, K]
+
+        # --- rollout ---
+        if is_hybrid:
+            c_rom_tBK, _, c_pred_tBK = field.predict(
+                c0, t_shared,
+                method=method, rtol=rtol, atol=atol, options=ode_options,
+                return_components=True,
+            )
+            c_pred = c_pred_tBK.permute(1, 0, 2)  # [B, nT, K]
+            c_rom = c_rom_tBK.permute(1, 0, 2)
+        else:
+            c0_train = transform.encode(c0) if transform is not None else c0
+            try:
+                c_pred_tr = odeint_fwd(
+                    field, c0_train, t_shared,
+                    method=method, rtol=rtol, atol=atol, options=ode_options,
+                )  # [nT, B, K]
+            except (AssertionError, RuntimeError):
+                n_failed += len(b_ids)
+                continue
+            if not torch.isfinite(c_pred_tr).all():
+                n_failed += len(b_ids)
+                continue
+            c_pred_tr = c_pred_tr.permute(1, 0, 2)  # [B, nT, K]
+            c_pred = transform.decode(c_pred_tr) if transform is not None else c_pred_tr
+            c_rom = None
+
+        # --- coefficient-space metrics (batched) ---
+        diff2 = (c_pred - c_true) ** 2
+        ic_mse = diff2.mean(dim=(1, 2))                             # [B]
+        ic_rel = torch.sqrt(diff2.sum(dim=(1, 2)) /
+                            (c_true ** 2).sum(dim=(1, 2)).clamp(min=1e-30))
+
+        per_ic_mse_coeff.append(ic_mse.cpu())
+        per_ic_rel_l2_coeff.append(ic_rel.cpu())
+
+        if is_hybrid:
+            rom_diff2 = (c_rom - c_true) ** 2
+            per_ic_mse_rom.append(rom_diff2.mean(dim=(1, 2)).cpu())
+            per_ic_rel_l2_rom.append(
+                torch.sqrt(rom_diff2.sum(dim=(1, 2)) /
+                           (c_true ** 2).sum(dim=(1, 2)).clamp(min=1e-30)).cpu()
+            )
+
+        # --- spatial-domain metrics (per-IC, memory-safe) ---
+        if reconstruct:
+            for i in range(len(b_ids)):
+                u_pred = dataset.reconstruct_u(c_pred[i])   # [nT, nx]
+                u_true = dataset.reconstruct_u(c_true[i])
+                diff_u = (u_pred - u_true) ** 2
+                per_ic_mse_spatial.append(float(diff_u.mean().item()))
+                per_ic_rel_l2_spatial.append(
+                    float(torch.sqrt(diff_u.sum() /
+                                     (u_true ** 2).sum().clamp(min=1e-30)).item())
+                )
+
+                if is_hybrid:
+                    u_rom = dataset.reconstruct_u(c_rom[i])
+                    diff_rom_u = (u_rom - u_true) ** 2
+                    per_ic_mse_rom_spatial.append(float(diff_rom_u.mean().item()))
+                    per_ic_rel_l2_rom_spatial.append(
+                        float(torch.sqrt(diff_rom_u.sum() /
+                                         (u_true ** 2).sum().clamp(min=1e-30)).item())
+                    )
+
+    # --- aggregate ---
+    per_ic_mse_coeff = torch.cat(per_ic_mse_coeff).numpy()
+    per_ic_rel_l2_coeff = torch.cat(per_ic_rel_l2_coeff).numpy()
+
+    results = {
+        "mse_coeff": float(per_ic_mse_coeff.mean()),
+        "rel_l2_coeff": float(per_ic_rel_l2_coeff.mean()),
+        "per_ic_mse_coeff": per_ic_mse_coeff,
+        "per_ic_rel_l2_coeff": per_ic_rel_l2_coeff,
+        "n_evaluated": len(per_ic_mse_coeff),
+        "n_failed": n_failed,
+    }
+
+    if reconstruct:
+        per_ic_mse_spatial = np.array(per_ic_mse_spatial)
+        per_ic_rel_l2_spatial = np.array(per_ic_rel_l2_spatial)
+        results.update({
+            "mse_spatial": float(per_ic_mse_spatial.mean()),
+            "rel_l2_spatial": float(per_ic_rel_l2_spatial.mean()),
+            "per_ic_mse_spatial": per_ic_mse_spatial,
+            "per_ic_rel_l2_spatial": per_ic_rel_l2_spatial,
+        })
+
+    if is_hybrid:
+        per_ic_mse_rom = torch.cat(per_ic_mse_rom).numpy()
+        per_ic_rel_l2_rom = torch.cat(per_ic_rel_l2_rom).numpy()
+        mse_rom_agg = float(per_ic_mse_rom.mean())
+        results.update({
+            "mse_rom": mse_rom_agg,
+            "rel_l2_rom": float(per_ic_rel_l2_rom.mean()),
+            "per_ic_mse_rom": per_ic_mse_rom,
+            "per_ic_rel_l2_rom": per_ic_rel_l2_rom,
+            "improvement_coeff_pct": (mse_rom_agg - results["mse_coeff"]) / max(mse_rom_agg, 1e-30) * 100,
+        })
+        if reconstruct:
+            per_ic_mse_rom_spatial = np.array(per_ic_mse_rom_spatial)
+            per_ic_rel_l2_rom_spatial = np.array(per_ic_rel_l2_rom_spatial)
+            mse_rom_sp_agg = float(per_ic_mse_rom_spatial.mean())
+            results.update({
+                "mse_rom_spatial": mse_rom_sp_agg,
+                "rel_l2_rom_spatial": float(per_ic_rel_l2_rom_spatial.mean()),
+                "per_ic_mse_rom_spatial": per_ic_mse_rom_spatial,
+                "per_ic_rel_l2_rom_spatial": per_ic_rel_l2_rom_spatial,
+                "improvement_spatial_pct": (mse_rom_sp_agg - results["mse_spatial"]) / max(mse_rom_sp_agg, 1e-30) * 100,
+            })
+
+    if verbose:
+        _print_eval_summary(results, is_hybrid=is_hybrid, reconstruct=reconstruct)
+
+    return results
+
+
+def _print_eval_summary(results, is_hybrid=False, reconstruct=True):
+    """Pretty-print evaluation results."""
+    n = results["n_evaluated"]
+    nf = results["n_failed"]
+
+    print(f"\n{'='*60}")
+    print(f"EVALUATION SUMMARY  ({n} ICs evaluated, {nf} failed)")
+    print(f"{'='*60}")
+
+    print(f"  MSE  (coeff) : {results['mse_coeff']:.6e}")
+    print(f"  Rel L2(coeff): {results['rel_l2_coeff']:.4e}")
+
+    if reconstruct and "mse_spatial" in results:
+        print(f"  MSE  (spatial): {results['mse_spatial']:.6e}")
+        print(f"  Rel L2(spatial): {results['rel_l2_spatial']:.4e}")
+
+    if is_hybrid:
+        print(f"\n  ROM baseline:")
+        print(f"    MSE  (coeff) : {results['mse_rom']:.6e}")
+        print(f"    Rel L2(coeff): {results['rel_l2_rom']:.4e}")
+        print(f"    Improvement (coeff): {results['improvement_coeff_pct']:+.2f}%")
+        if reconstruct and "mse_rom_spatial" in results:
+            print(f"    MSE  (spatial): {results['mse_rom_spatial']:.6e}")
+            print(f"    Rel L2(spatial): {results['rel_l2_rom_spatial']:.4e}")
+            print(f"    Improvement (spatial): {results['improvement_spatial_pct']:+.2f}%")
+
+    print(f"{'='*60}\n")
+
+
 # =====================================================================
 # Visualization Functions
 # =====================================================================

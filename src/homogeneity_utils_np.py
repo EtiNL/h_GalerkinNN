@@ -17,37 +17,8 @@ def norm_h(x, tol=1e-4):
 
     return np.sqrt(num)
 
-def norm_d(x, max_steps = 200, eps = 0.001):
-    s_inf = -3.0
-    s_sup = 3.0
-    s_mid = 0.5*(s_sup + s_inf)
-
-    n_inf = norm_h(dilation(-s_inf, x))
-    n_sup = norm_h(dilation(-s_sup, x))
-    n_mid = norm_h(dilation(-s_mid, x))
-
-    assert n_sup < 1.0, f"n_sup = {n_sup} > 1.0"
-    assert n_inf > 1.0, f"n_inf = {n_inf} < 1.0"
-    
-
-    steps = 0
-    while (np.abs(1.0 - n_mid) > eps) and steps < max_steps:
-        s_mid = 0.5*(s_sup + s_inf)
-        n_mid = norm_h(dilation(-s_mid, x))
-
-        if n_mid < 1.0:
-            n_sup = n_mid
-            s_sup = s_mid
-        
-        else:
-            n_inf = n_mid
-            s_inf = s_mid
-        
-        steps += 1
-
-    assert steps < max_steps, "max norm_d steps reached"
-    
-    return np.exp(s_mid)
+def norm_d(x, tol=1e-8):
+    return norm_h(x, tol=tol) ** 2
 
 #--------------------------------Finite dimensional analogues-------------------------------------
 
